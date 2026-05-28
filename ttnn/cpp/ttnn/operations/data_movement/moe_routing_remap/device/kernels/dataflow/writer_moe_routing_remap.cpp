@@ -34,7 +34,7 @@ void kernel_main() {
     CircularBuffer local_weights_idxs_cb(local_weights_idxs_cb_id);
 
     local_weights_cb.reserve_back(1);
-    const uint32_t local_weights_l1_addr = local_weights_cb.get_read_ptr();
+    const uint32_t local_weights_l1_addr = local_weights_cb.get_write_ptr();
     local_weights_cb.push_back(1);
 
     fill_with_val<weight_addr_t>(local_weights_l1_addr, num_cluster_experts, 0u);
