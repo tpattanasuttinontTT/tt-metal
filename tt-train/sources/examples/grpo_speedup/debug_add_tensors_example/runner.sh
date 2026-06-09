@@ -20,7 +20,7 @@ if [[ -z "${TT_METAL_HOME:-}" ]]; then
     exit 1
 fi
 
-EXAMPLE_DIR="${TT_METAL_HOME}/tt-train/sources/examples/grpo_speedup/debug"
+EXAMPLE_DIR="${TT_METAL_HOME}/tt-train/sources/examples/grpo_speedup/debug_add_tensors_example"
 HOST_FILE="${EXAMPLE_DIR}/configurations/local2/hosts.txt"
 RANK_BINDINGS_FILE="${EXAMPLE_DIR}/configurations/local2/rank_bindings.yaml"
 
