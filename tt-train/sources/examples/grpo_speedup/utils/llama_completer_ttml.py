@@ -2,15 +2,21 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""ttml-backed Llama completer (verbatim copy from ``examples/grpo``).
+"""DEPRECATED: superseded by :mod:`utils.llama_grpo_completer`.
 
-This module preserves the ``GRPOCompleter`` implementation that drives
-the Python ttml ``Llama`` model directly (with the
-``LlamaCompositeKV`` attention override). It lives alongside the
-tt-transformers-backed completer in :mod:`utils.llama_completer` so
-``gen_hf_ttt.py`` can compare both backends against HuggingFace on the same
-prompts. The class is named ``LlamaCompleterTtml`` so both completers can
-be imported into the same script without a name clash.
+This module is kept around for the manual integration scripts
+(``manual_ttml_to_ttt_weight_transfer.py``,
+``test_ttml_to_ttt_weight_transfer.py``) which build a ttml-side
+completer in-process (no RPC) to inspect / push weights directly.
+
+New code that drives a GRPO training run should use
+:class:`utils.llama_grpo_completer.LlamaGRPOCompleter` instead -- it
+implements the same ``GRPOCompleter`` interface but delegates
+``generate`` and ``generate_str`` to a remote ``TttGenerationWorker``
+over :class:`utils.inference_bridge.TttInferenceClient`, while keeping
+``compute_nlog_probs`` local. See
+``boolq_training_example/boolq_training_example.py`` for the full
+launcher pattern.
 """
 
 from __future__ import annotations
