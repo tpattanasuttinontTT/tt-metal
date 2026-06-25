@@ -47,7 +47,11 @@ void kernel_main() {
     unary_op_init_common(cb_in, cb_out);
     copy_tile_init(cb_in);
 
-    DeviceTimestampedData("PROG_ID", program_id);
+    // op_to_op event ids for DeviceRecordEvent (no data payload = less L1 pressure). Kept in
+    // sync with export_op_to_op_profiler_csv.py EVENT_NAMES.
+    constexpr uint16_t EV_UNPACK_TILE0 = 12, EV_PACK_FINISH = 13;
+
+    DeviceTimestampedData("PROG_ID", program_id);  // keep: program id used for prog association
 
     // The actual per-tile consumer work: copy CB_in -> dst regs (+ NOP spin) -> CB_out.
     // Kept identical across profiling modes so lean mode changes only instrumentation.
@@ -77,7 +81,7 @@ void kernel_main() {
             UNPACK(DeviceTimestampedData("TILE_IDX", i));
         } else {
             if (i == 0) {
-                UNPACK(DeviceTimestampedData("TILE_IDX", i));
+                UNPACK(DeviceRecordEvent(EV_UNPACK_TILE0));  // lean: first-math marker (tile 0 only)
             }
         }
 
@@ -92,5 +96,5 @@ void kernel_main() {
         cb_pop_front(cb_in, 1);
     }
 
-    PACK(DeviceTimestampedData("FINISH_LAST_PUSH", program_id));
+    PACK(DeviceRecordEvent(EV_PACK_FINISH));
 }

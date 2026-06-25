@@ -51,10 +51,14 @@ void kernel_main() {
     constexpr uint32_t tiles_per_page = TILES_PER_PAGE > 0 ? TILES_PER_PAGE : 1;
     constexpr uint32_t trid_in_flight = TRID_IN_FLIGHT > 0 ? TRID_IN_FLIGHT : 1;
 
+    // op_to_op event ids for DeviceRecordEvent (lighter than DeviceTimestampedData: no data
+    // payload = less L1 pressure). Kept in sync with export_op_to_op_profiler_csv.py EVENT_NAMES.
+    constexpr uint16_t EV_NCRISC_GO = 1, EV_READ_BEFORE = 2, EV_READ_AFTER = 3, EV_READ_LAST = 4, EV_NCRISC_DONE = 5;
+
     const auto src = TensorAccessor(src_args, src_addr);
 
-    DeviceTimestampedData("PROG_ID", program_id);
-    DeviceTimestampedData("NCRISC_GO", program_id);
+    DeviceTimestampedData("PROG_ID", program_id);  // keep: program id used for prog association
+    DeviceRecordEvent(EV_NCRISC_GO);
 
     // When CROSS_PROGRAM_OFFSET_TILES > 0, each program reads a disjoint tile slice
     // so the DRAM controller sees fresh row opens per program (more app-like).
@@ -106,7 +110,7 @@ void kernel_main() {
         cb_reserve_back(cb_in, 2 * batch_tiles);
         const uint32_t cb_base = get_write_ptr(cb_in);
 
-        DeviceTimestampedData("READ_BEFORE_BARRIER", effective_start_tile_id);
+        DeviceRecordEvent(EV_READ_BEFORE);
 
         // Prologue: issue batch 0 on TRID_A.
         uint32_t issue_trid = TRID_A;
@@ -133,7 +137,7 @@ void kernel_main() {
             issued += nb;
 
             noc_async_read_barrier_with_trid(drain_trid);
-            DeviceTimestampedData("READ_AFTER_BARRIER", effective_start_tile_id);
+            DeviceRecordEvent(EV_READ_AFTER);
             cb_push_back(cb_in, batch_tiles);
             pushed += N;
             drain_trid ^= 1u;
@@ -166,12 +170,12 @@ void kernel_main() {
         noc_async_read_barrier_with_trid(drain_trid);
         if (pushed == 0) {
             // n_pages <= N: head never ran, so emit the first-read marker here.
-            DeviceTimestampedData("READ_AFTER_BARRIER", effective_start_tile_id);
+            DeviceRecordEvent(EV_READ_AFTER);
         }
-        DeviceTimestampedData("READ_LAST_BARRIER", effective_start_tile_id);
+        DeviceRecordEvent(EV_READ_LAST);
         cb_push_back(cb_in, (n_pages - pushed) * tiles_per_page);
 
-        DeviceTimestampedData("NCRISC_DONE", program_id);
+        DeviceRecordEvent(EV_NCRISC_DONE);
         return;
     }
 
@@ -188,12 +192,12 @@ void kernel_main() {
                 const uint32_t tid = tile_id + i;
                 const uint32_t l1_write_addr = cb_base + i * tile_bytes;
                 if (tid == effective_start_tile_id) {
-                    DeviceTimestampedData("READ_BEFORE_BARRIER", tid);
+                    DeviceRecordEvent(EV_READ_BEFORE);
                 }
                 noc_async_read_tile(tid, src, l1_write_addr);
                 noc_async_read_barrier();
                 if (tid == effective_start_tile_id) {
-                    DeviceTimestampedData("READ_AFTER_BARRIER", tid);
+                    DeviceRecordEvent(EV_READ_AFTER);
                 }
             }
             cb_push_back(cb_in, chunk);
@@ -202,12 +206,12 @@ void kernel_main() {
                 const uint32_t tid = tile_id + i;
                 const uint32_t l1_write_addr = get_write_ptr(cb_in);
                 if (tid == effective_start_tile_id) {
-                    DeviceTimestampedData("READ_BEFORE_BARRIER", tid);
+                    DeviceRecordEvent(EV_READ_BEFORE);
                 }
                 noc_async_read_tile(tid, src, l1_write_addr);
                 noc_async_read_barrier();
                 if (tid == effective_start_tile_id) {
-                    DeviceTimestampedData("READ_AFTER_BARRIER", tid);
+                    DeviceRecordEvent(EV_READ_AFTER);
                 }
                 cb_push_back(cb_in, 1);
             }
@@ -216,5 +220,5 @@ void kernel_main() {
         tile_id += chunk;
     }
 
-    DeviceTimestampedData("NCRISC_DONE", program_id);
+    DeviceRecordEvent(EV_NCRISC_DONE);
 }

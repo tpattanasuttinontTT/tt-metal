@@ -43,9 +43,39 @@ def parse_chip_freq_mhz(log_path: Path) -> float:
     return float(match.group(1))
 
 
+# DeviceRecordEvent ids -> original marker names. Kept in sync with the EV_* constants in the
+# op_to_op kernels (reader/writer/compute). recordEvent is lighter than DeviceTimestampedData
+# (no data payload = less L1 buffer pressure); the id is the low 16 bits of timer_id.
+EVENT_NAMES = {
+    1: "NCRISC_GO",
+    2: "READ_BEFORE_BARRIER",
+    3: "READ_AFTER_BARRIER",
+    4: "READ_LAST_BARRIER",
+    5: "NCRISC_DONE",
+    6: "BRISC_GO",
+    7: "WRITE_BEFORE_BARRIER",
+    8: "WRITE_LAST_ISSUED",
+    9: "WRITE_LAST_FLUSHED",
+    10: "WRITE_AFTER_BARRIER",
+    11: "BRISC_DONE",
+    12: "TILE_IDX",  # lean-mode first-math (tile 0)
+    13: "FINISH_LAST_PUSH",  # last-math / pack finish
+}
+
+
 def load_profiler_csv(log_path: Path) -> pd.DataFrame:
     df = pd.read_csv(log_path, skiprows=1)
     df.columns = df.columns.str.strip()
+    # Backfill original marker names for DeviceRecordEvent markers (type == TS_EVENT): they have an
+    # empty zone name; the event id is timer_id & 0xFFFF (get_id = (id & 0xFFFF) | (type << 16)).
+    # Events carry no payload, so set data = 0 (the TILE_IDX event is tile 0). This keeps every
+    # name-keyed walk (and decompose / event_timeline) working unchanged.
+    if "type" in df.columns and "timer_id" in df.columns:
+        is_ev = df["type"].astype(str).str.strip() == "TS_EVENT"
+        if is_ev.any():
+            ids = df.loc[is_ev, "timer_id"].astype("int64") & 0xFFFF
+            df.loc[is_ev, "zone name"] = ids.map(EVENT_NAMES).values
+            df.loc[is_ev, "data"] = 0
     return df
 
 

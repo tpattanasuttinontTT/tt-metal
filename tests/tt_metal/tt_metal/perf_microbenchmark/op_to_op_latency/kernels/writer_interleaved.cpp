@@ -57,10 +57,15 @@ void kernel_main() {
     constexpr uint32_t max_writes_before_flush = cb_page_slots > 1 ? cb_page_slots - 1 : 1;
     constexpr auto dst_args = TensorAccessorArgs<6>();
 
+    // op_to_op event ids for DeviceRecordEvent (no data payload = less L1 pressure than
+    // DeviceTimestampedData). Kept in sync with export_op_to_op_profiler_csv.py EVENT_NAMES.
+    constexpr uint16_t EV_BRISC_GO = 6, EV_WRITE_BEFORE = 7, EV_WRITE_LAST_ISSUED = 8, EV_WRITE_LAST_FLUSHED = 9,
+                       EV_WRITE_BARRIER_DONE = 10, EV_BRISC_DONE = 11;
+
     const auto dst = TensorAccessor(dst_args, dst_addr);
 
-    DeviceTimestampedData("PROG_ID", program_id);
-    DeviceTimestampedData("BRISC_GO", program_id);
+    DeviceTimestampedData("PROG_ID", program_id);  // keep: program id used for prog association
+    DeviceRecordEvent(EV_BRISC_GO);
 
     // When CROSS_PROGRAM_OFFSET_TILES > 0, each program writes a disjoint slice
     // (mirrors reader); host allocates a buffer large enough for all slices.
@@ -73,7 +78,7 @@ void kernel_main() {
     const uint32_t end_page_id = start_page_id + n_pages;
     const uint32_t last_page_id = (n_pages > 0) ? (end_page_id - 1) : start_page_id;
 
-    DeviceTimestampedData("WRITE_BEFORE_BARRIER", last_page_id);
+    DeviceRecordEvent(EV_WRITE_BEFORE);
 
     uint32_t writes_since_flush = 0;
     for (uint32_t page_id = start_page_id; page_id < end_page_id; ++page_id) {
@@ -90,14 +95,18 @@ void kernel_main() {
         cb_pop_front(cb_out, tiles_per_page);
     }
 
+    // Timeline markers: last write issued -> last write flushed -> barrier complete.
+    DeviceRecordEvent(EV_WRITE_LAST_ISSUED);
     if constexpr (READ_ONLY == 0) {
+        if constexpr (END_BARRIER_MODE != 2) {
+            noc_async_writes_flushed();  // writes have left local L1
+        }
+        DeviceRecordEvent(EV_WRITE_LAST_FLUSHED);
         if constexpr (END_BARRIER_MODE == 0) {
-            noc_async_write_barrier();
-        } else if constexpr (END_BARRIER_MODE == 1) {
-            noc_async_writes_flushed();
+            noc_async_write_barrier();  // writes ACKed at DRAM
         }
     }
-    DeviceTimestampedData("WRITE_AFTER_BARRIER", last_page_id);
+    DeviceRecordEvent(EV_WRITE_BARRIER_DONE);  // = barrier complete (END_BARRIER_MODE 0)
 
-    DeviceTimestampedData("BRISC_DONE", program_id);
+    DeviceRecordEvent(EV_BRISC_DONE);
 }
