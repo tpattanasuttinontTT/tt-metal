@@ -226,6 +226,20 @@ Do **not** use `DeviceZoneScopedMainN` in compute `kernel_main` (breaks `TRISC-K
 marker pairing). Wrap unpack/pack timestamps in `UNPACK(...)` / `PACK(...)` so each
 marker appears only on the intended TRISC.
 
+### Profiler ACCUMULATE mode (`TT_METAL_PROFILER_ACCUMULATE=1`) — branch-only
+
+This benchmark sometimes runs with the profiler's *accumulate* mode to keep the per-program
+profiler **L1→DRAM write out of the op-to-op gap** (that write otherwise lands between programs
+and pollutes the op-to-op latency measurement). In accumulate mode the per-RISC L1 buffer holds
+several program iterations and only flushes to DRAM once nearly full, with the residual read
+back from L1.
+
+This mode is a **branch-only measurement hack and must NOT be productized / pushed to `main`**
+(per the profiler team). It has known limitations — e.g. host readback breaks with our custom
+markers and at high program counts (see `generated/profiler_accumulate_repro.md`). Future
+profiler work will provide a proper mechanism to suppress/relocate that DRAM write; this benchmark
+should switch to it when it lands. Do not rely on accumulate mode outside this branch.
+
 ## Sweep scripts
 
 All sweep scripts write per-config runs under `generated/profiler/op_to_op_runs/<batch>/` and a
