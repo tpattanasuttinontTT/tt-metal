@@ -10,7 +10,7 @@
 //   2: start_tile_id          (in tiles)
 //   3: program_id
 //
-// Compile-time args (see TensorAccessorArgs<6> for src accessor):
+// Compile-time args (see TensorAccessorArgs<7> for src accessor):
 //   0: cb_in
 //   1: READER_MODE            (0 = reserve N, read+push one-by-one with a global barrier
 //                              1 = reserve N, read all, single barrier, push N
@@ -26,6 +26,9 @@
 //   5: CROSS_PROGRAM_OFFSET_TILES (0 = every program reads the same slice; >0 = program k
 //                              reads pages starting at start_tile_id + k*OFFSET. Host
 //                              must allocate a buffer big enough for all program slices.)
+//   6: READ_BYTES_OVERRIDE     (reader_mode 2 only; 0 = read full page. >0 = NoC-read only this
+//                              many bytes per page but still push a full CB page -- "cheap read"
+//                              for the output-bound regime, valid only because payload is dummy.)
 //
 // Profiler on first tile of the slice only: READ_BEFORE_BARRIER / READ_AFTER_BARRIER.
 
@@ -45,7 +48,12 @@ void kernel_main() {
     constexpr uint32_t TILES_PER_PAGE = get_compile_time_arg_val(3);
     constexpr uint32_t TRID_IN_FLIGHT = get_compile_time_arg_val(4);
     constexpr uint32_t CROSS_PROGRAM_OFFSET_TILES = get_compile_time_arg_val(5);
-    constexpr auto src_args = TensorAccessorArgs<6>();
+    // Cheap-read override (reader_mode 2 only): 0 = read the full page; >0 = NoC-read only this
+    // many BYTES per page but still push a full CB page. Payload is dummy, so this makes reads
+    // ~free to force the output-bound regime. Uses the same read_cmd_buf (and thus the trid set
+    // by noc_async_read_set_trid), so the per-trid barriers still drain these reads correctly.
+    constexpr uint32_t READ_BYTES_OVERRIDE = get_compile_time_arg_val(6);
+    constexpr auto src_args = TensorAccessorArgs<7>();
 
     constexpr uint32_t chunk_size = PUSH_TILE_COUNT > 0 ? PUSH_TILE_COUNT : 1;
     constexpr uint32_t tiles_per_page = TILES_PER_PAGE > 0 ? TILES_PER_PAGE : 1;
@@ -110,6 +118,17 @@ void kernel_main() {
         cb_reserve_back(cb_in, 2 * batch_tiles);
         const uint32_t cb_base = get_write_ptr(cb_in);
 
+        // Issue one page read into cb_base under the currently-set trid. Normally a full-page
+        // tile read; in cheap-read mode only READ_BYTES_OVERRIDE bytes (dummy payload) so the
+        // read side is ~free and the writer becomes the bottleneck (output-bound).
+        auto issue_read = [&](uint32_t pid) {
+            if constexpr (READ_BYTES_OVERRIDE > 0) {
+                noc_async_read(src.get_noc_addr(pid), cb_base, READ_BYTES_OVERRIDE);
+            } else {
+                noc_async_read_tile(pid, src, cb_base);
+            }
+        };
+
         DeviceRecordEvent(EV_READ_BEFORE);
 
         // Prologue: issue batch 0 on TRID_A.
@@ -119,7 +138,7 @@ void kernel_main() {
         uint32_t issued = n_pages < N ? n_pages : N;
         noc_async_read_set_trid(issue_trid);
         for (uint32_t i = 0; i < issued; ++i) {
-            noc_async_read_tile(page_id++, src, cb_base);
+            issue_read(page_id++);
         }
         uint32_t pushed = 0;
 
@@ -132,7 +151,7 @@ void kernel_main() {
             const uint32_t nb = remaining < N ? remaining : N;
             noc_async_read_set_trid(issue_trid);
             for (uint32_t i = 0; i < nb; ++i) {
-                noc_async_read_tile(page_id++, src, cb_base);
+                issue_read(page_id++);
             }
             issued += nb;
 
@@ -152,7 +171,7 @@ void kernel_main() {
             cb_reserve_back(cb_in, batch_tiles);
             noc_async_read_set_trid(issue_trid);
             for (uint32_t i = 0; i < nb; ++i) {
-                noc_async_read_tile(page_id++, src, cb_base);
+                issue_read(page_id++);
             }
             issued += nb;
 

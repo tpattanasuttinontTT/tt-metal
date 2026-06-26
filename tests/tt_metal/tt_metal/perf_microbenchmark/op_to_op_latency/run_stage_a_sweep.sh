@@ -15,6 +15,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TT_METAL_HOME="${TT_METAL_HOME:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}"
 export TT_METAL_DEVICE_PROFILER=1
+cd "${TT_METAL_HOME}" || exit 1  # binary detects root from cwd, not env -> must run from repo root
 # dispatch-core profiling off (workers only); official op2op uses KERNEL zones, no DISP markers needed
 # export TT_METAL_DEVICE_PROFILER_DISPATCH=1
 

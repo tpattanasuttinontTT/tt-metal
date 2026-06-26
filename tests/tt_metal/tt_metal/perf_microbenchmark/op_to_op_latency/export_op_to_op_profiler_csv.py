@@ -231,6 +231,8 @@ def walk_barrier_markers(df: pd.DataFrame) -> dict[str, dict[tuple, int]]:
         "READ_BEFORE_BARRIER",
         "READ_AFTER_BARRIER",
         "WRITE_BEFORE_BARRIER",
+        "WRITE_LAST_ISSUED",
+        "WRITE_LAST_FLUSHED",
         "WRITE_AFTER_BARRIER",
         "BRISC_GO",
         "BRISC_DONE",
@@ -247,6 +249,8 @@ def walk_barrier_markers(df: pd.DataFrame) -> dict[str, dict[tuple, int]]:
         "read_before",
         "read_after",
         "write_before",
+        "write_last_issued",
+        "write_last_flushed",
         "write_after",
         "brisc_go",
         "brisc_done",
@@ -297,6 +301,10 @@ def walk_barrier_markers(df: pd.DataFrame) -> dict[str, dict[tuple, int]]:
                 out["read_after"][tkey] = time_cycles
             elif zone == "WRITE_BEFORE_BARRIER" and is_writer:
                 out["write_before"][tkey] = time_cycles
+            elif zone == "WRITE_LAST_ISSUED" and is_writer:
+                out["write_last_issued"][tkey] = time_cycles
+            elif zone == "WRITE_LAST_FLUSHED" and is_writer:
+                out["write_last_flushed"][tkey] = time_cycles
             elif zone == "WRITE_AFTER_BARRIER" and is_writer:
                 out["write_after"][tkey] = time_cycles
             elif zone == "BRISC_GO" and is_writer:

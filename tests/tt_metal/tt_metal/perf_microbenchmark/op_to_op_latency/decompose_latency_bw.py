@@ -320,6 +320,12 @@ def main() -> int:
     read_fill = per_core_diff_us(unpack0, barriers["read_before"], freq, args.min_prog_id)
     r2w = per_core_diff_us(barriers["brisc_done"], barriers["ncrisc_done"], freq, args.min_prog_id)
     wtail = per_core_diff_us(barriers["write_after"], barriers["write_before"], freq, args.min_prog_id)
+    # write_drain = LAST write issued -> write barrier complete (WRITE_LAST_ISSUED -> WRITE_AFTER_BARRIER).
+    # This is the un-hideable write latency paid at op end: the final flush+barrier draining the
+    # writes still outstanding when the loop exits. With per-CB flushing ~(cb_page_slots-1) writes
+    # are in flight at the end, so it rises ~linearly with output CB depth. Distinct from write_tail
+    # (WRITE_BEFORE->WRITE_AFTER = whole write phase ~= bytes/BW, ~flat in CB depth).
+    wdrain = per_core_diff_us(barriers["write_after"], barriers["write_last_issued"], freq, args.min_prog_id)
     rd_spread = completion_spread_us(barriers["ncrisc_done"], freq, args.min_prog_id)
     wr_spread = completion_spread_us(barriers["brisc_done"], freq, args.min_prog_id)
     # Op2op + kernel duration via the OFFICIAL tools/tracy methodology from the standard
@@ -362,6 +368,8 @@ def main() -> int:
         "reader_to_writer_max_us": round(vmax(r2w), 4),
         "write_tail_us": round(median(wtail), 4),
         "write_tail_max_us": round(vmax(wtail), 4),
+        "write_drain_us": round(median(wdrain), 4),  # last write issued -> barrier done (the real write tail)
+        "write_drain_max_us": round(vmax(wdrain), 4),
         # op execution skew (NoC starvation), distinct from inter-op latency above:
         "reader_done_spread_us": round(median(rd_spread), 4),
         "writer_done_spread_us": round(median(wr_spread), 4),

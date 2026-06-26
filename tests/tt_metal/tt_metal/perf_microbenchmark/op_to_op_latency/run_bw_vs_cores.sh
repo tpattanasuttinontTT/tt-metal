@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Canonical sweep 2/6: aggregate BW + done-skew + starvation vs core count.
+# Full read+write op by default; set READ_ONLY=1 for the read-only variant (writer just pops
+# the CB, no DRAM writes -> isolates read BW and read-side completion skew).
+# Good NoCs (reader=NOC0, writer=NOC1), row-major fill, lean compute, trace warmup.
+# Per core count picks the input-CB depth maximizing agg_read (read-only) / agg_total (full-op).
+# Records: cores,in_cb,agg_read_gbps,agg_write_gbps,agg_total_gbps,
+#          reader_done_spread_us,writer_done_spread_us,starvation_ratio.
+#
+# Env: READ_ONLY (0/1), CORES, INPUT_DEPTHS, N (trid), PAGES, OUT, OUTDIR.
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export TT_METAL_HOME="${TT_METAL_HOME:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}"
+export TT_METAL_DEVICE_PROFILER=1
+cd "${TT_METAL_HOME}" || exit 1  # binary detects root from cwd, not env -> must run from repo root
+BIN="${TT_METAL_HOME}/build_RelWithDebInfo/test/tt_metal/perf_microbenchmark/op_to_op_latency/test_op_to_op_latency"
+PY="${TT_METAL_HOME}/python_env/bin/python3"
+DEC="${SCRIPT_DIR}/decompose_latency_bw.py"
+DEV_CSV="${TT_METAL_HOME}/generated/profiler/.logs/profile_log_device.csv"
+OUTDIR="${OUTDIR:-${TT_METAL_HOME}/generated/profiler/op_to_op_runs/stage_a}"
+READ_ONLY="${READ_ONLY:-0}"
+DEFAULT_OUT="bw_vs_cores.csv"; [ "${READ_ONLY}" = "1" ] && DEFAULT_OUT="bw_vs_cores_readonly.csv"
+OUT="${OUT:-${OUTDIR}/${DEFAULT_OUT}}"
+mkdir -p "${OUTDIR}"
+
+INPUT_DEPTHS="${INPUT_DEPTHS:-16 32}"
+N="${N:-8}"
+PAGES="${PAGES:-1024}"
+CORES="${CORES:-1 2 4 8 16 24 32 40 48 56}"
+# read-only skips output validation natively; full-op uses dummy strided reads -> skip it too.
+if [ "${READ_ONLY}" = "1" ]; then MODE_FLAGS="--read-only"; RANK="agg_read_gbps"; else MODE_FLAGS="--skip-output-validation"; RANK="agg_total_gbps"; fi
+
+echo "cores,in_cb,agg_read_gbps,agg_write_gbps,agg_total_gbps,reader_done_spread_us,writer_done_spread_us,starvation_ratio" > "${OUT}"
+
+for cores in ${CORES}; do
+  best=0; best_line=""
+  for d in ${INPUT_DEPTHS}; do
+    rm -f "${DEV_CSV}"
+    "${BIN}" ${MODE_FLAGS} --lean-compute --reader-noc 0 --writer-noc 1 \
+      --reader-dbuf-trid --reader-trid-in-flight "${N}" --reader-push-tiles 2 \
+      --input-cb-depth-tiles "${d}" --output-cb-depth-tiles 2 \
+      --num-pages-per-core "${PAGES}" --num-programs 2 --compute-nops 0 \
+      --use-trace --trace-warmup-replays 1 --num-active-cores "${cores}" --use-device-profiler \
+      >/tmp/bwvc_run.log 2>&1
+    grep -q PASSED /tmp/bwvc_run.log || continue
+    read -r rb wb tb rds wds st rank < <("${PY}" "${DEC}" --pages-per-core "${PAGES}" --num-cores "${cores}" 2>/dev/null | awk -v rk="${RANK}" '
+      /agg_read_gbps/{r=$2} /agg_write_gbps/{w=$2} /agg_total_gbps/{t=$2}
+      /reader_done_spread_us/{rd=$2} /writer_done_spread_us/{wd=$2} /starvation_ratio/{s=$2}
+      $1==rk{rv=$2} END{print r, w, t, rd, wd, s, rv}')
+    awk -v a="${rank:-0}" -v b="${best}" 'BEGIN{exit !(a>b)}' && {
+      best="${rank}"; best_line="${cores},${d},${rb},${wb},${tb},${rds},${wds},${st}"; }
+  done
+  [ -n "${best_line}" ] && { echo "${best_line}" >> "${OUT}"; echo "${best_line}"; } \
+    || echo "cores=${cores} FAILED (no PASSED run)"
+done
+echo "BW_VS_CORES_COMPLETE (read_only=${READ_ONLY}) -> ${OUT}"

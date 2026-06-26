@@ -133,6 +133,11 @@ struct BenchmarkConfig {
     // DRAM page size in tiles. Larger pages = fewer, larger NoC transactions
     // per program. CB pages stay 1 tile each so compute kernel is unchanged.
     uint32_t page_size_tiles = 1;
+    // Reader-only "cheap read" override (reader_mode 2). 0 = read the full page (normal).
+    // >0 = NoC-read only this many BYTES per page but still push a full CB page. Since the
+    // payload is dummy, this makes reads ~free to force the OUTPUT-BOUND regime (writer is
+    // the bottleneck; output CB fills at slow cores -> output-side starvation).
+    uint32_t reader_read_bytes = 0;
     // Cap active core count. 0 = use full grid (default). Used to test whether
     // brisc_done_to_go scales with core count.
     uint32_t num_active_cores = 0;
@@ -210,6 +215,7 @@ BenchmarkConfig parse_args(const std::vector<std::string>& args) {
     cfg.page_size_tiles = test_args::get_command_option_uint32(args, "--page-size-tiles", cfg.page_size_tiles);
     cfg.reader_trid_in_flight =
         test_args::get_command_option_uint32(args, "--reader-trid-in-flight", cfg.reader_trid_in_flight);
+    cfg.reader_read_bytes = test_args::get_command_option_uint32(args, "--reader-read-bytes", cfg.reader_read_bytes);
     cfg.num_active_cores = test_args::get_command_option_uint32(args, "--num-active-cores", cfg.num_active_cores);
     if (test_args::has_command_option(args, "--core-layout-col")) {
         cfg.core_layout_col = true;
@@ -706,10 +712,17 @@ BuiltProgram build_program(
     // Reader: NOC1 / RISCV1, pulls from interleaved DRAM via TensorAccessor.
     // Compile-time args order MUST match reader_interleaved.cpp:
     //   [0]=cb_in, [1]=READER_MODE, [2]=PUSH_TILE_COUNT, [3]=TILES_PER_PAGE,
-    //   [4]=TRID_IN_FLIGHT, [5]=CROSS_PROGRAM_OFFSET_TILES, then TensorAccessorArgs starting at index 6.
+    //   [4]=TRID_IN_FLIGHT, [5]=CROSS_PROGRAM_OFFSET_TILES, [6]=READ_BYTES_OVERRIDE,
+    //   then TensorAccessorArgs starting at index 7.
     const uint32_t cross_program_offset_tiles = cfg.cross_program_dram_offset ? total_num_tiles : 0u;
     std::vector<uint32_t> reader_compile_time_args = {
-        kInputCbId, cfg.reader_mode, push_tiles, page_size_tiles, trid_in_flight, cross_program_offset_tiles};
+        kInputCbId,
+        cfg.reader_mode,
+        push_tiles,
+        page_size_tiles,
+        trid_in_flight,
+        cross_program_offset_tiles,
+        cfg.reader_read_bytes};
     // Defaults: reader=NOC0, writer=NOC1 (measured best). --reader-noc/--writer-noc override.
     // HARD CONSTRAINT: the two data-movement kernels on a core must be on DIFFERENT NoCs.
     // Putting both on the same NoC hangs the device (requires a chip reset), so fail fast.
