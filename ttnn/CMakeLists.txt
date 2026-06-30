@@ -271,6 +271,7 @@ target_link_libraries(
         TTNN::Ops::Experimental::DeepSeekPrefill::H2dSocketSync
         TTNN::Ops::Experimental::IsIn
         TTNN::Ops::Experimental::Matmul
+        TTNN::Ops::Experimental::MatmulDecode
         TTNN::Ops::Experimental::PaddedSlice
         TTNN::Ops::Experimental::MinimalMatmul
         TTNN::Ops::Experimental::DeepseekMoEPostCombineTilize
@@ -313,7 +314,6 @@ target_link_libraries(
         TTNN::Ops::KvCache
         TTNN::Ops::Loss
         TTNN::Ops::Matmul
-        TTNN::Ops::MatmulDecode
         TTNN::Ops::Moreh
         TTNN::Ops::Prefetcher
         TTNN::Ops::Reduction
@@ -586,7 +586,7 @@ add_subdirectory(cpp/ttnn/operations/kernel_helper_functions)
 add_subdirectory(cpp/ttnn/operations/kv_cache)
 add_subdirectory(cpp/ttnn/operations/loss)
 add_subdirectory(cpp/ttnn/operations/matmul)
-add_subdirectory(cpp/ttnn/operations/matmul_decode)
+add_subdirectory(cpp/ttnn/operations/experimental/matmul_decode)
 add_subdirectory(cpp/ttnn/operations/moreh)
 add_subdirectory(cpp/ttnn/operations/normalization)
 add_subdirectory(cpp/ttnn/operations/point_to_point)
