@@ -345,7 +345,17 @@ class ttMLA:
         self.sp_factor = mesh_device.shape[self.sp_axis]
 
         self.ccl_num_links = 2 if is_blackhole() else 1  # Blackhole trains 2 fabric routing planes, others 1
-        self.ccl_topology = topology
+        # Per-axis CCL topology, named symmetrically by axis. The q/kv/wo collectives run on the TP
+        # axis (cluster_axis=tp_axis) and use tp_ccl_topology; the ring-attention SDPA (ring_mla /
+        # ring_joint_sdpa) runs on the SP axis (cluster_axis=sp_axis) and MUST use sp_ccl_topology.
+        # Conflating them deadlocks the SDPA when the two axes differ: e.g. under FABRIC_2D_TORUS_X the
+        # TP axis is Ring but the SP axis has no physical wrap, so a TP-Ring topology on the SP-axis
+        # SDPA waits forever on a missing wrap link. A scalar applies to both axes (preserves 1D-ring /
+        # non-torus behavior).
+        if isinstance(topology, tuple):
+            self.sp_ccl_topology, self.tp_ccl_topology = topology  # (sp_axis_0, tp_axis_1)
+        else:
+            self.sp_ccl_topology = self.tp_ccl_topology = topology
 
         # Ring-attention persistent buffers. Chunked prefill (ring_mla) and the standard ring
         # joint SDPA use disjoint buffer sets, so allocate only the one the configured mode needs --
@@ -454,7 +464,8 @@ class ttMLA:
                     layer_idx=self.layer_idx,
                     tt_ccl=self.tt_ccl,
                     ccl_num_links=self.ccl_num_links,
-                    ccl_topology=self.ccl_topology,
+                    sp_ccl_topology=self.sp_ccl_topology,
+                    tp_ccl_topology=self.tp_ccl_topology,
                     seq_len=seq_len,
                     slot_num=slot_num,
                     layer_num=self.layer_num,
@@ -725,7 +736,7 @@ class ttMLA:
             num_links=self.ccl_num_links,
             cluster_axis=self.sp_axis,
             mesh_device=self.mesh_device,
-            topology=self.ccl_topology,
+            topology=self.sp_ccl_topology,
             ccl_core_grid_offset=self.tt_ccl.ring_attention_ccl_core_grid_offset,
             use_column_major_ccl=True,
             is_balanced=self.is_balanced,
@@ -770,7 +781,7 @@ class ttMLA:
                 barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=self.tp_axis),
                 num_links=self.ccl_num_links,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                topology=self.ccl_topology,
+                topology=self.tp_ccl_topology,
                 cluster_axis=self.tp_axis,
             )
             qr = ttnn.experimental.all_gather_async(
@@ -780,7 +791,7 @@ class ttMLA:
                 barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=self.tp_axis),
                 num_links=self.ccl_num_links,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                topology=self.ccl_topology,
+                topology=self.tp_ccl_topology,
                 cluster_axis=self.tp_axis,
             )
 
@@ -876,7 +887,7 @@ class ttMLA:
                 barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=self.tp_axis),
                 num_links=self.ccl_num_links,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                topology=self.ccl_topology,
+                topology=self.tp_ccl_topology,
                 cluster_axis=self.tp_axis,
             )
             tt_kv = ttnn.experimental.fast_reduce_nc(
@@ -982,7 +993,7 @@ class ttMLA:
                 barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=self.tp_axis),
                 num_links=self.ccl_num_links,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                topology=self.ccl_topology,
+                topology=self.tp_ccl_topology,
                 cluster_axis=self.tp_axis,
             )
         return v_out
@@ -1128,7 +1139,7 @@ class ttMLA:
             num_links=self.ccl_num_links,
             cluster_axis=self.sp_axis,
             mesh_device=self.mesh_device,
-            topology=self.ccl_topology,
+            topology=self.sp_ccl_topology,
             ccl_core_grid_offset=self.tt_ccl.ring_attention_ccl_core_grid_offset,
             use_column_major_ccl=True,
             is_causal=True,
@@ -1270,7 +1281,7 @@ class ttMLA:
                 barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=self.tp_axis),
                 num_links=self.ccl_num_links,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                topology=self.ccl_topology,
+                topology=self.tp_ccl_topology,
                 cluster_axis=self.tp_axis,
             )
             tt_kv = ttnn.experimental.fast_reduce_nc(
@@ -1328,6 +1339,8 @@ class ttMLA:
         factor = self.sp_factor if cluster_axis == self.sp_axis else self.tp_factor
         if factor == 1:
             return t
+        # Per-axis topology: match the ring/line topology to the axis this gather rides.
+        topology = self.sp_ccl_topology if cluster_axis == self.sp_axis else self.tp_ccl_topology
         return ttnn.experimental.all_gather_async(
             t,
             dim=dim,
@@ -1335,7 +1348,7 @@ class ttMLA:
             barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis=cluster_axis),
             num_links=self.ccl_num_links,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            topology=self.ccl_topology,
+            topology=topology,
             cluster_axis=cluster_axis,
         )
 
