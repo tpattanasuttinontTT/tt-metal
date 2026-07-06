@@ -4,6 +4,8 @@
 
 import os
 import signal
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from loguru import logger
@@ -40,6 +42,82 @@ def _handle_sigterm(signum, frame):
 
 def _is_shutdown() -> bool:
     return _shutdown
+
+
+class _Metrics:
+    """Thread-safe prefill metrics; snapshot() renders Prometheus text."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.requests_total = 0
+        self.tokens_total = 0
+        self.latency_ms_sum = 0.0
+        self.latency_ms_count = 0
+        self.last_latency_ms = 0.0
+
+    def record(self, latency_ms: float, num_tokens: int) -> None:
+        with self._lock:
+            self.requests_total += 1
+            self.tokens_total += num_tokens
+            self.latency_ms_sum += latency_ms
+            self.latency_ms_count += 1
+            self.last_latency_ms = latency_ms
+
+    def snapshot(self) -> str:
+        with self._lock:
+            lines = [
+                "# HELP prefill_up 1 if runner is alive.",
+                "# TYPE prefill_up gauge",
+                "prefill_up 1",
+                "# HELP prefill_requests_total Total prefill requests served.",
+                "# TYPE prefill_requests_total counter",
+                f"prefill_requests_total {self.requests_total}",
+                "# HELP prefill_tokens_total Total input tokens prefilled (actual_isl).",
+                "# TYPE prefill_tokens_total counter",
+                f"prefill_tokens_total {self.tokens_total}",
+                "# HELP prefill_last_latency_ms Latency of the most recent pipeline.prefill() call.",
+                "# TYPE prefill_last_latency_ms gauge",
+                f"prefill_last_latency_ms {self.last_latency_ms:.3f}",
+                "# HELP prefill_latency_ms_sum Sum of pipeline.prefill() latencies in ms.",
+                "# TYPE prefill_latency_ms_sum counter",
+                f"prefill_latency_ms_sum {self.latency_ms_sum:.3f}",
+                "# HELP prefill_latency_ms_count Number of observed pipeline.prefill() calls.",
+                "# TYPE prefill_latency_ms_count counter",
+                f"prefill_latency_ms_count {self.latency_ms_count}",
+            ]
+            return "\n".join(lines) + "\n"
+
+
+_metrics = _Metrics()
+
+
+class _MetricsHandler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802 - http.server API
+        if self.path == "/metrics":
+            body = _metrics.snapshot().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):  # silence default stderr access log
+        return
+
+
+def _maybe_start_metrics_server() -> ThreadingHTTPServer | None:
+    port = int(os.environ.get("PREFILL_METRICS_PORT", "0"))
+    if port <= 0:
+        return None
+    host = os.environ.get("PREFILL_METRICS_HOST", "0.0.0.0")
+    server = ThreadingHTTPServer((host, port), _MetricsHandler)
+    thread = threading.Thread(target=server.serve_forever, name="prefill-metrics", daemon=True)
+    thread.start()
+    logger.info(f"[metrics] serving on http://{host}:{port}/metrics")
+    return server
 
 
 def _load_hf_config():
@@ -150,6 +228,7 @@ def run_standalone_loop(pipeline: TtDeepSeekPrefillPipeline) -> None:
         first_token = pipeline.prefill(token_ids=token_ids, slot_id=0, actual_isl=actual_isl)
         _dt_ms = (_time.perf_counter() - _t0) * 1000.0
         iter_times_ms.append(_dt_ms)
+        _metrics.record(_dt_ms, actual_isl)
         logger.info(
             f"[prefill timing] task_id={task_id} iter={i} num_tokens={len(token_ids)} "
             f"pipeline.prefill() = {_dt_ms:.2f} ms"
@@ -241,6 +320,7 @@ def run_request_loop(pipeline: TtDeepSeekPrefillPipeline) -> None:
                 dst_slot=dst_slot,
             )
             _dt_ms = (_time.perf_counter() - _t0) * 1000.0
+            _metrics.record(_dt_ms, actual_isl)
             logger.info(
                 f"[prefill timing] task_id={task_id} num_tokens={len(token_ids)} "
                 f"dst_slot={dst_slot if dst_slot != INVALID_SLOT_ID else '-'} "
@@ -273,6 +353,8 @@ def _print_config() -> None:
         ("PREFILL_STANDALONE_ITERS", os.environ.get("PREFILL_STANDALONE_ITERS", "1")),
         ("PREFILL_ENABLE_MIGRATION", os.environ.get("PREFILL_ENABLE_MIGRATION", "0")),
         ("PREFILL_DEBUG", os.environ.get("PREFILL_DEBUG", "0")),
+        ("PREFILL_METRICS_PORT", os.environ.get("PREFILL_METRICS_PORT", "0")),
+        ("PREFILL_METRICS_HOST", os.environ.get("PREFILL_METRICS_HOST", "0.0.0.0")),
     ]
 
     sep = "=" * 70
@@ -366,11 +448,18 @@ def main() -> None:
         pipeline.setup_migration(endpoint, DECODE_EP_ID)
         logger.info("[migration] pipeline.setup_migration() done; per-layer migrations fire on every prefill request")
 
+    metrics_server = _maybe_start_metrics_server()
+
     logger.info("Setup complete, entering request loop")
-    if os.environ.get("PREFILL_STANDALONE", "0") == "1":
-        run_standalone_loop(pipeline)
-    else:
-        run_request_loop(pipeline)
+    try:
+        if os.environ.get("PREFILL_STANDALONE", "0") == "1":
+            run_standalone_loop(pipeline)
+        else:
+            run_request_loop(pipeline)
+    finally:
+        if metrics_server is not None:
+            metrics_server.shutdown()
+            metrics_server.server_close()
 
     ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
     ttnn.close_mesh_device(mesh_device)
