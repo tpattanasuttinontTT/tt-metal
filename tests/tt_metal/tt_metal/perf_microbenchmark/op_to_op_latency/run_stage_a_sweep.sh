@@ -37,7 +37,20 @@ N="${N:-4}"                                  # trid_in_flight (4 saturates BW at
 # writer-CB/barrier contribution = m2m(mode 0) - m2m(mode 2). Tuning runs at TUNE_BARRIER.
 BARRIER_MODES="${BARRIER_MODES:-0 1 2}"
 TUNE_BARRIER="${TUNE_BARRIER:-0}"
-PAGES="${PAGES:-1024}"                       # tiles/core
+# Fixed-TOTAL (data-parallel) work model: a real op shards a fixed-size tensor across the grid,
+# so pages_per_core = TOTAL_PAGES / cores. This keeps execution duration bounded as cores grow
+# (instead of weak-scaling, where fixed pages/core makes the high-core write phase ~1ms and
+# swamps the op-to-op / skew signal). TOTAL_PAGES=3584 -> 56c gets 64 pages (~67us of work,
+# calibrated), large enough that compute (NOPs) actually back-pressures the reader, and divides
+# evenly across {1,2,4,8,16,32,56}. PAGES is recomputed per core count.
+TOTAL_PAGES="${TOTAL_PAGES:-3584}"
+MIN_PAGES_PER_CORE="${MIN_PAGES_PER_CORE:-8}"  # floor so the trid pipeline (in_cb >= 2*N) stays valid
+# Cap input-CB depth at pages_per_core / IN_CB_CAP_FRAC so the reader CANNOT stage the whole shard
+# and run ahead of compute. Without this the peak-BW in_cb tune just picks a CB big enough to hold
+# the shard, the reader never stalls on compute, and the NOP knee degenerates to max. /4 keeps the
+# reader >=~75% compute-coupled (calibrated: in_cb=16 at 64 pages gates read BW ~8% under load).
+IN_CB_CAP_FRAC="${IN_CB_CAP_FRAC:-4}"
+PAGES=1024                                     # placeholder; set to TOTAL_PAGES/cores in the core loop
 TUNE_PROGS="${TUNE_PROGS:-2}"
 FINAL_PROGS="${FINAL_PROGS:-4}"
 BW_TOL="${BW_TOL:-0.98}"                     # smallest depth within this frac of peak BW
@@ -67,6 +80,16 @@ for layout in ${LAYOUTS}; do
   lf=""; [ "${layout}" = "col" ] && lf="--core-layout-col"
   OUT="${OUTDIR}/stage_a_${layout}.csv"
   for C in ${CORES}; do
+    # Fixed-total work: this core count's per-core shard (floored so the trid pipeline stays valid).
+    PAGES=$(( TOTAL_PAGES / C ))
+    (( PAGES < MIN_PAGES_PER_CORE )) && PAGES=${MIN_PAGES_PER_CORE}
+    # Capped input-CB candidates: only depths small enough that the reader can't hold the whole
+    # shard (in_cb <= PAGES/IN_CB_CAP_FRAC), so compute can back-pressure it. Fall back to the
+    # smallest candidate if the shard is too small for any to qualify.
+    IN_DEPTHS_CAPPED=""
+    for d in ${INPUT_DEPTHS}; do (( d * IN_CB_CAP_FRAC <= PAGES )) && IN_DEPTHS_CAPPED="${IN_DEPTHS_CAPPED} ${d}"; done
+    [ -z "${IN_DEPTHS_CAPPED}" ] && IN_DEPTHS_CAPPED="$(set -- ${INPUT_DEPTHS}; echo "$1")"
+    echo "==== ${layout} cores=${C}: pages/core=${PAGES} (total~$(( PAGES * C )) of ${TOTAL_PAGES}); in_cb candidates=[${IN_DEPTHS_CAPPED} ] ===="
     # Skip this (layout,cores) only if every barrier-mode row is already present.
     if [ -f "${OUT}" ]; then
       have_all=1
@@ -76,7 +99,7 @@ for layout in ${LAYOUTS}; do
     # --- Stage 1: tune input CB depth at nops=0 (read-bound), max agg_read ---
     echo "==== ${layout} cores=${C}: tuning input CB depth (nops=0) ===="
     best_bw=0; declare -A BW_AT; declare -A PCMED_AT
-    for d in ${INPUT_DEPTHS}; do
+    for d in ${IN_DEPTHS_CAPPED}; do
       if ! run_test "${lf}" "${C}" "${d}" "${OUT_CB_BASE}" 0 "${TUNE_PROGS}"; then
         echo "  in_cb=${d}: FAILED ($(grep -oE 'TT_FATAL: .*' /tmp/stage_a_run.log | head -1))"; continue
       fi
@@ -87,7 +110,7 @@ for layout in ${LAYOUTS}; do
     done
     [ "${best_bw}" = "0" ] && { echo "  no successful input tune; skipping"; unset BW_AT PCMED_AT; continue; }
     best_in=""
-    for d in ${INPUT_DEPTHS}; do
+    for d in ${IN_DEPTHS_CAPPED}; do
       [ -z "${BW_AT[$d]:-}" ] && continue
       if awk -v a="${BW_AT[$d]}" -v p="${best_bw}" -v t="${BW_TOL}" 'BEGIN{exit !(a>=p*t)}'; then best_in="${d}"; break; fi
     done
@@ -141,7 +164,13 @@ for layout in ${LAYOUTS}; do
         "${PY}" "${DEC}" --pages-per-core "${PAGES}" --num-cores "${C}" --csv-out "${OUT}" \
           --label "layout=${layout};cores=${C};barrier=${m};in_cb=${best_in};out_cb=${best_out};nops=${nops};peak_read_gbps=${peak_read}" \
           2>/dev/null | grep -E "agg_total_gbps|m2m_bubble_us|m2m_skew_env_us|finish_skew_us|start_skew_us|read_fill_head_us"
-        echo "  appended ${layout} cores=${C} barrier=${m} -> ${OUT}"
+        # per-config event timeline (go -> ... -> go received; delta + cumulative cyc/us) from the
+        # same device log this run just produced. Appends one block per config to a per-layout CSV.
+        "${PY}" "${SCRIPT_DIR}/event_timeline.py" --input-file "${DEV_CSV}" \
+          --csv-out "${OUTDIR}/stage_a_timeline_${layout}.csv" \
+          --label "layout=${layout};cores=${C};barrier=${m};in_cb=${best_in};out_cb=${best_out};nops=${nops}" \
+          >/dev/null 2>&1 || echo "  [timeline skipped: <2 steady ops] ${layout} cores=${C} barrier=${m}"
+        echo "  appended ${layout} cores=${C} barrier=${m} -> ${OUT} (+ timeline)"
       else
         echo "  FINAL FAILED ${layout} cores=${C} barrier=${m}: $(grep -oE 'TT_FATAL: .*' /tmp/stage_a_run.log | head -1)"
       fi

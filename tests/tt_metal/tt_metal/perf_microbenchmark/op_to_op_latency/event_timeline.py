@@ -68,6 +68,8 @@ def main():
     ap.add_argument(
         "--max-op-us", type=float, default=5000.0, help="drop op instances longer than this (trace boundary)"
     )
+    ap.add_argument("--csv-out", type=Path, default=None, help="append the timeline (one row per event) to this CSV")
+    ap.add_argument("--label", type=str, default="", help="label column value for --csv-out rows (e.g. config id)")
     args = ap.parse_args()
     log = (args.input_file or Path("generated/profiler/.logs/profile_log_device.csv")).resolve()
     freq = parse_chip_freq_mhz(log)  # MHz == cycles/us
@@ -143,6 +145,34 @@ def main():
     print(f"read skew (first->last core first-read-return) = {deltas['read skew (last core 1st return)']:,.0f} cyc")
     done_skew = float(np.median([r["last core barrier done"] - r["first core barrier done"] for r in steady]))
     print(f"done skew (first->last core barrier done) = {done_skew:,.0f} cyc")
+
+    # Persist the timeline: one row per event with delta-from-prior and cumulative-from-go, in
+    # both cycles and us (1 cyc = 1/freq us). Appends so a sweep can collect many configs (one
+    # --label per config) into a single CSV. done_skew is derivable as
+    # cum_us(last core barrier done) - cum_us(first core barrier done).
+    if args.csv_out:
+        import csv
+
+        new_file = not args.csv_out.exists()
+        args.csv_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.csv_out, "a", newline="") as fh:
+            w = csv.writer(fh)
+            if new_file:
+                w.writerow(["label", "cores", "event", "delta_cyc", "cum_cyc", "delta_us", "cum_us"])
+            cum = 0.0
+            for ev in order:
+                cum += deltas[ev]
+                w.writerow(
+                    [
+                        args.label,
+                        ncores,
+                        ev,
+                        f"{deltas[ev]:.0f}",
+                        f"{cum:.0f}",
+                        f"{deltas[ev]/freq:.4f}",
+                        f"{cum/freq:.4f}",
+                    ]
+                )
     return 0
 
 
