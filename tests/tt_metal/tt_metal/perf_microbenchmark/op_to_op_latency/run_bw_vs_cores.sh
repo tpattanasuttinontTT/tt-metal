@@ -28,14 +28,24 @@ mkdir -p "${OUTDIR}"
 
 INPUT_DEPTHS="${INPUT_DEPTHS:-16 32}"
 N="${N:-8}"
-PAGES="${PAGES:-1024}"
 CORES="${CORES:-1 2 4 8 16 24 32 40 48 56}"
+# Fixed-TOTAL (data-parallel) work model, matching run_stage_a_sweep.sh: a real op shards a
+# fixed-size tensor across the grid, so pages_per_core = TOTAL_PAGES / cores (recomputed per core
+# count below). This keeps execution duration realistic instead of weak-scaling total work with
+# cores. NOTE: at high core counts the small shard pays a ~5% pipeline fill/drain tax on aggregate
+# BW (56c: ~205 vs ~215 GB/s at a large shard) -- that IS the realistic sharded-op number.
+# Set PAGES=<n> to force the legacy fixed-per-core model instead.
+TOTAL_PAGES="${TOTAL_PAGES:-3584}"
+MIN_PAGES_PER_CORE="${MIN_PAGES_PER_CORE:-8}"
+PAGES_OVERRIDE="${PAGES:-}"
 # read-only skips output validation natively; full-op uses dummy strided reads -> skip it too.
 if [ "${READ_ONLY}" = "1" ]; then MODE_FLAGS="--read-only"; RANK="agg_read_gbps"; else MODE_FLAGS="--skip-output-validation"; RANK="agg_total_gbps"; fi
 
-echo "cores,in_cb,agg_read_gbps,agg_write_gbps,agg_total_gbps,reader_done_spread_us,writer_done_spread_us,starvation_ratio" > "${OUT}"
+echo "cores,pages,in_cb,agg_read_gbps,agg_write_gbps,agg_total_gbps,reader_done_spread_us,writer_done_spread_us,starvation_ratio" > "${OUT}"
 
 for cores in ${CORES}; do
+  if [ -n "${PAGES_OVERRIDE}" ]; then PAGES="${PAGES_OVERRIDE}"; else
+    PAGES=$(( TOTAL_PAGES / cores )); (( PAGES < MIN_PAGES_PER_CORE )) && PAGES=${MIN_PAGES_PER_CORE}; fi
   best=0; best_line=""
   for d in ${INPUT_DEPTHS}; do
     rm -f "${DEV_CSV}"
@@ -51,7 +61,7 @@ for cores in ${CORES}; do
       /reader_done_spread_us/{rd=$2} /writer_done_spread_us/{wd=$2} /starvation_ratio/{s=$2}
       $1==rk{rv=$2} END{print r, w, t, rd, wd, s, rv}')
     awk -v a="${rank:-0}" -v b="${best}" 'BEGIN{exit !(a>b)}' && {
-      best="${rank}"; best_line="${cores},${d},${rb},${wb},${tb},${rds},${wds},${st}"; }
+      best="${rank}"; best_line="${cores},${PAGES},${d},${rb},${wb},${tb},${rds},${wds},${st}"; }
   done
   [ -n "${best_line}" ] && { echo "${best_line}" >> "${OUT}"; echo "${best_line}"; } \
     || echo "cores=${cores} FAILED (no PASSED run)"

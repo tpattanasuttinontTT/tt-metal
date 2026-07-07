@@ -22,11 +22,12 @@
 #        Input CB + N held fixed.
 #  Good NoCs (reader=NOC0/writer=NOC1), lean compute (nops=0), trace. in_cb=64 (>= 2*N for N<=32).
 # Records CSVs:
-#   read_lat_vs_n.csv               : cores,N,read_fill_head_us,m2m_bubble_us,official_op2op_min_us,agg_total_gbps
-#   write_lat_vs_outcb.csv          : (rb=0)  cores,out_cb,read_bytes,agg_write_gbps,write_drain_us,writer_done_spread_us,write_tail_us,starvation_ratio
+#   read_lat_vs_n.csv               : cores,pages,N,read_fill_head_us,m2m_bubble_us,official_op2op_min_us,agg_total_gbps
+#   write_lat_vs_outcb.csv          : (rb=0)  cores,pages,out_cb,read_bytes,agg_write_gbps,write_drain_us,writer_done_spread_us,write_tail_us,starvation_ratio
 #   write_lat_vs_outcb_cheapread.csv: (rb>0)  same columns, output-bound regime
 #
-# Env: CORES_LIST, N_LIST, OUTCB_LIST, READ_BYTES_LIST, IN_CB, OUT_CB_FIXED, N_FIXED, PAGES, OUTDIR.
+# Env: CORES_LIST, N_LIST, OUTCB_LIST, READ_BYTES_LIST, IN_CB, OUT_CB_FIXED, N_FIXED, TOTAL_PAGES,
+#      MIN_PAGES_PER_CORE, PAGES (override -> fixed-per-core), OUTDIR.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TT_METAL_HOME="${TT_METAL_HOME:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}"
@@ -46,7 +47,16 @@ READ_BYTES_LIST="${READ_BYTES_LIST:-0 32}"   # 0 = full read (read-bound); 32 = 
 IN_CB="${IN_CB:-64}"
 OUT_CB_FIXED="${OUT_CB_FIXED:-8}"   # output CB during the read-side (N) sweep
 N_FIXED="${N_FIXED:-8}"             # trid during the write-side (out_cb) sweep
-PAGES="${PAGES:-1024}"
+# Fixed-TOTAL (data-parallel) work model, matching run_stage_a_sweep.sh: PAGES = TOTAL_PAGES /
+# cores, set per core count by set_pages() below. Set PAGES=<n> to force fixed-per-core.
+TOTAL_PAGES="${TOTAL_PAGES:-3584}"
+MIN_PAGES_PER_CORE="${MIN_PAGES_PER_CORE:-8}"
+PAGES_OVERRIDE="${PAGES:-}"
+PAGES=1024  # placeholder; set_pages() overwrites per core count
+set_pages() { # cores
+  if [ -n "${PAGES_OVERRIDE}" ]; then PAGES="${PAGES_OVERRIDE}"; else
+    PAGES=$(( TOTAL_PAGES / $1 )); (( PAGES < MIN_PAGES_PER_CORE )) && PAGES=${MIN_PAGES_PER_CORE}; fi
+}
 
 run() { # N in_cb out_cb cores read_bytes -> runs full op; leaves DEV_CSV
   rm -f "${DEV_CSV}"
@@ -69,14 +79,15 @@ fields() {
 
 # (A) read-fill latency vs N -- always full reads.
 A="${OUTDIR}/read_lat_vs_n.csv"
-echo "cores,N,read_fill_head_us,m2m_bubble_us,official_op2op_min_us,agg_total_gbps" > "${A}"
+echo "cores,pages,N,read_fill_head_us,m2m_bubble_us,official_op2op_min_us,agg_total_gbps" > "${A}"
 echo "==== (A) read-fill latency vs N (in_cb=${IN_CB}, out_cb=${OUT_CB_FIXED}) ===="
 for C in ${CORES_LIST}; do
+  set_pages "${C}"
   for N in ${N_LIST}; do
     [ "${IN_CB}" -lt $((2 * N)) ] && { echo "cores=${C} N=${N} SKIP (in_cb<2N)"; continue; }
     if run "${N}" "${IN_CB}" "${OUT_CB_FIXED}" "${C}" 0; then
       read -r rf m o wd wt at aw ws s < <(fields "${C}")
-      echo "${C},${N},${rf},${m},${o},${at}" | tee -a "${A}"
+      echo "${C},${PAGES},${N},${rf},${m},${o},${at}" | tee -a "${A}"
     else echo "cores=${C} N=${N} FAILED"; fi
   done
 done
@@ -87,12 +98,13 @@ for RB in ${READ_BYTES_LIST}; do
   if [ "${RB}" -gt 0 ]; then B="${OUTDIR}/write_lat_vs_outcb_cheapread.csv"; tag="cheap-read ${RB}B (output-bound)";
   else                       B="${OUTDIR}/write_lat_vs_outcb.csv";          tag="full read (read-bound)"; fi
   echo "  -- regime: ${tag} -> ${B}"
-  echo "cores,out_cb,read_bytes,agg_write_gbps,write_drain_us,writer_done_spread_us,write_tail_us,starvation_ratio" > "${B}"
+  echo "cores,pages,out_cb,read_bytes,agg_write_gbps,write_drain_us,writer_done_spread_us,write_tail_us,starvation_ratio" > "${B}"
   for C in ${CORES_LIST}; do
+    set_pages "${C}"
     for OC in ${OUTCB_LIST}; do
       if run "${N_FIXED}" "${IN_CB}" "${OC}" "${C}" "${RB}"; then
         read -r rf m o wd wt at aw ws s < <(fields "${C}")
-        echo "${C},${OC},${RB},${aw},${wd},${ws},${wt},${s}" | tee -a "${B}"
+        echo "${C},${PAGES},${OC},${RB},${aw},${wd},${ws},${wt},${s}" | tee -a "${B}"
       else echo "cores=${C} out_cb=${OC} rb=${RB} FAILED"; fi
     done
   done
