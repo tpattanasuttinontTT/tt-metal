@@ -325,10 +325,16 @@ std::vector<tt::tt_metal::DynamicRuntimeArg> SliceDeviceOperation::get_dynamic_r
     const tensor_args_t& tensor_args,
     tensor_return_value_t& output,
     const std::optional<ttnn::MeshCoordinate>& /*mesh_dispatch_coordinate*/) {
+    const auto factory = select_program_factory(args, tensor_args);
+    // Interleaved RM factory: the reader's aligned source base (input address + hash-constant offset)
+    // is not a plain buffer base, so it rides on get_dynamic_runtime_args rather than a Buffer* binding.
+    if (std::holds_alternative<SliceRmProgramFactory>(factory)) {
+        return slice_rm_reader_dynamic_args(args, tensor_args, output);
+    }
     // Height-sharded RM factory is CB-bound: addresses ride on the sharded CBs, so re-apply reader arg0
     // (num source cores, from the same per-core walk create_descriptor uses) on core 0 to trip the
     // fast-path and let the framework re-patch the CB addresses instead of rebuilding. (#48928)
-    if (!std::holds_alternative<SliceRmShardedProgramFactory>(select_program_factory(args, tensor_args))) {
+    if (!std::holds_alternative<SliceRmShardedProgramFactory>(factory)) {
         return {};
     }
     const auto& input = tensor_args.input;
