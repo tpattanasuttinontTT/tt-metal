@@ -51,6 +51,7 @@
 #include "ckernel_sfpu_unary_max_min.h"
 #include "ckernel_sfpu_reduce.h"
 #include "ckernel_sfpu_alt_complex_rotate90.h"
+#include "ckernel_sfpu_selfcontained_init.h"
 #else
 #include "ckernel_sfpu_sigmoid.h"
 #include "ckernel_sfpu_silu.h"
@@ -441,7 +442,7 @@ ALWI void abs_tile(uint32_t idst) {
 /**
  * Please refer to documentation for any_init.
  */
-ALWI void abs_tile_init() { MATH(SFPU_UNARY_INIT(abs)); }
+ALWI void abs_tile_init() { MATH(SFPU_UNARY_INIT_SC(abs, sfpu::_init_abs_)); }
 
 // clang-format off
 /**

@@ -8,6 +8,7 @@
 #if defined(TRISC_MATH) || defined(TRISC_PACK)
 #include "ckernel_sfpu_exp.h"
 #include "llk_math_eltwise_unary_sfpu_macros.h"
+#include "ckernel_sfpu_selfcontained_init.h"
 #endif
 
 namespace ckernel {
@@ -35,9 +36,9 @@ template <
     uint32_t scale = 0x3F800000,
     InputClamping input_clamping = InputClamping::ClampToNegative>
 ALWI void exp_tile_init() {
-    MATH(SFPU_UNARY_INIT_FN(
+    MATH(SFPU_UNARY_INIT_SC_FN(
         exponential,
-        sfpu::exp_init,
+        sfpu::_init_exp_,
         (approx, scale, (input_clamping == InputClamping::ClampToNegative), DST_ACCUM_MODE)));
 }
 
