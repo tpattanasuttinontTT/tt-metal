@@ -9,6 +9,8 @@
 
 #include <stdint.h>
 
+#include "block_cyclic_remap.hpp"
+
 namespace sparse_sdpa {
 
 // Per-NoC trid-ring depth for each gather half (swept: 4 is the sweet spot — with the split halving each
@@ -39,17 +41,9 @@ constexpr uint32_t K_TRID_RING = 4;
 //                         slab s back by slab*gap.
 // Sentinels (0xFFFFFFFF) never reach here — the reader only gathers the valid (< nv) prefix.
 
-// natural (logical) index n -> block-cyclic physical row (invP). See the file header for the layout
-// reasoning. Parameterized (rather than reading the BC_* defines directly) so other block-cyclic gather
-// kernels (e.g. the indexer) can reuse the same remap. All args are compile-time constants at the call
-// site, so this folds to one compile-time divide (mul+shift) + shift/mask.
-FORCE_INLINE uint32_t logical_to_chunked_physical(
-    uint32_t n, uint32_t chunk_local, uint32_t sp, uint32_t shard_stride_gap, uint32_t slab_stride_gap) {
-    const uint32_t block_idx = n / chunk_local;  // = slab*sp + shard (natural-order block index)
-    const uint32_t slab = block_idx / sp;
-    const uint32_t shard = block_idx - slab * sp;
-    return n + shard * shard_stride_gap - slab * slab_stride_gap;
-}
+// natural (logical) index n -> block-cyclic physical row (invP); the parameterized def is shared from
+// block_cyclic_remap.hpp so the indexer and sparse_sdpa_msa gathers reuse the same remap. Units are rows here.
+using tt::block_cyclic::logical_to_chunked_physical;
 
 template <typename Accessor>
 FORCE_INLINE void trid_ring_gather(
