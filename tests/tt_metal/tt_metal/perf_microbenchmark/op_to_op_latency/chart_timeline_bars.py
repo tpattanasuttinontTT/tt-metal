@@ -107,31 +107,34 @@ def main():
 
     if broken:
         fig, (axL, axR) = plt.subplots(
-            1, 2, figsize=(12, 3.6), sharey=True, gridspec_kw={"width_ratios": [1, 1.5], "wspace": 0.06}
+            1, 2, figsize=(12, 3.9), sharey=True, gridspec_kw={"width_ratios": [1, 1.5], "wspace": 0.06}
         )
         axes = [axL, axR]
         axL.set_xlim(-m_head, head_end + m_head)
         axR.set_xlim(tail_start - m_tail, end + m_tail)
     else:
-        fig, axL = plt.subplots(figsize=(12, 3.6))
+        fig, axL = plt.subplots(figsize=(12, 3.9))
         axes = [axL]
         axL.set_xlim(-m_head, end + m_tail)
 
+    # lane vertical centers -- close together (gap ~= 1/4 of the bar-to-bar distance)
+    LANE_Y = [0.0, 0.5]
     for y, (_name, sg) in enumerate(lanes):
+        yc = LANE_Y[y]
         for (x0, w), color in zip(sg, PHASE_COLORS):
             if w <= 0:
                 continue
             for ax in axes:
-                ax.broken_barh([(x0, w)], (y - 0.16, 0.32), facecolors=color, edgecolor="none")
+                ax.broken_barh([(x0, w)], (yc - 0.16, 0.32), facecolors=color, edgecolor="none")
         for x0, w in sg:  # boundary ticks
             for ax in axes:
-                ax.plot([x0, x0], [y - 0.18, y + 0.18], color="black", lw=0.5, alpha=0.4)
-                ax.plot([x0 + w, x0 + w], [y - 0.18, y + 0.18], color="black", lw=0.5, alpha=0.4)
+                ax.plot([x0, x0], [yc - 0.18, yc + 0.18], color="black", lw=0.5, alpha=0.4)
+                ax.plot([x0 + w, x0 + w], [yc - 0.18, yc + 0.18], color="black", lw=0.5, alpha=0.4)
 
     for ax in axes:
-        ax.set_yticks([0, 1])
+        ax.set_yticks(LANE_Y)
         ax.set_yticklabels([lanes[0][0], lanes[1][0]])
-        ax.set_ylim(-0.5, 2.1)
+        ax.set_ylim(-0.35, 1.0)
         ax.grid(axis="x", alpha=0.25)
 
     if broken:
@@ -149,34 +152,34 @@ def main():
     # skew arrows between the two lanes at key milestones (drawn on whichever axis holds them)
     def arrow(ax, x_first, x_last, ytext, txt, color):
         ax.annotate("", xy=(x_last, ytext), xytext=(x_first, ytext), arrowprops=dict(arrowstyle="<->", color=color))
-        ax.text((x_first + x_last) / 2, ytext + 0.06, txt, ha="center", va="bottom", fontsize=8, color=color)
+        ax.text((x_first + x_last) / 2, ytext + 0.02, txt, ha="center", va="bottom", fontsize=8, color=color)
 
     start_skew = head_end - E["first read return"]
     read_skew = E["last core reads complete"] - E["first core reads complete"]
     done_skew = E["last core barrier done"] - E["first core barrier done"]
     axH = axes[0]
-    arrow(axH, E["first read return"], head_end, 1.5, f"start skew {start_skew:.1f}us", "#4caf50")
+    arrow(axH, E["first read return"], head_end, 0.74, f"start skew {start_skew:.1f}us", "#4caf50")
     axT = axes[-1]
     arrow(
         axT,
         E["first core reads complete"],
         E["last core reads complete"],
-        1.5,
+        0.74,
         f"read skew {read_skew:.1f}us",
         "#2e7d32",
     )
     arrow(
-        axT, E["first core barrier done"], E["last core barrier done"], 1.9, f"done skew {done_skew:.1f}us", "#e53935"
+        axT, E["first core barrier done"], E["last core barrier done"], 0.9, f"done skew {done_skew:.1f}us", "#e53935"
     )
 
     title = args.title or f"op timeline (cores={args.cores}, barrier={args.barrier}): first vs last core envelope"
     fig.suptitle(title, fontsize=12)
-    fig.supxlabel("time since go (us)", fontsize=10, y=0.14)
+    fig.supxlabel("time since go (us)", fontsize=10, y=0.12)
     handles = [Patch(facecolor=c, label=l) for c, l in zip(PHASE_COLORS, PHASE_LABELS)]
-    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, -0.01), ncol=6, fontsize=8, framealpha=0.9)
-    fig.tight_layout(rect=[0, 0.12, 1, 0.93])
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, -0.04), ncol=6, fontsize=8, framealpha=0.9)
+    fig.tight_layout(rect=[0, 0.16, 1, 0.93])
     out = args.out_png or args.timeline_csv.with_name(f"timeline_bars_{args.cores}c_b{args.barrier}.png")
-    fig.savefig(out, dpi=140)
+    fig.savefig(out, dpi=140, bbox_inches="tight", pad_inches=0.25)
     print(
         f"cores={args.cores} b{args.barrier}: start_skew={start_skew:.2f} read_skew={read_skew:.2f} "
         f"done_skew={done_skew:.2f} op_span={end:.1f}us broken={broken}"
