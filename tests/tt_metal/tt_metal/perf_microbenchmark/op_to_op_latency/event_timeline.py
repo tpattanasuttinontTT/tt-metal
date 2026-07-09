@@ -9,6 +9,10 @@ Reconstructs one steady-state op's life across all worker cores and prints the o
   read issued                first NoC read issued (READ_BEFORE_BARRIER)
   first read return          earliest core's first read back (min READ_AFTER_BARRIER)
   read skew                  spread of first-read-return across cores (max-min READ_AFTER_BARRIER)
+  first core reads complete  earliest core done with ALL its reads (min READ_LAST_BARRIER)
+  last core reads complete   latest core done with ALL its reads (max READ_LAST_BARRIER); the
+                             delta first->last = INTER-core read-complete skew (exploitable stagger).
+                             Separately, INTRA-core span = per-core (READ_LAST - READ_AFTER), median.
   first core last wr issued  earliest core's last write issued (min WRITE_LAST_ISSUED)
   first core last wr flushed  min WRITE_LAST_FLUSHED
   first core barrier done    min WRITE_AFTER_BARRIER
@@ -39,6 +43,7 @@ def per_core_ops(df):
         "NCRISC_GO",
         "READ_BEFORE_BARRIER",
         "READ_AFTER_BARRIER",
+        "READ_LAST_BARRIER",
         "WRITE_LAST_ISSUED",
         "WRITE_LAST_FLUSHED",
         "WRITE_AFTER_BARRIER",
@@ -86,10 +91,28 @@ def main():
         "go",
         "READ_BEFORE_BARRIER",
         "READ_AFTER_BARRIER",
+        "READ_LAST_BARRIER",
         "WRITE_LAST_ISSUED",
         "WRITE_LAST_FLUSHED",
         "WRITE_AFTER_BARRIER",
         "go_received",
+    ]
+    # Timeline event order (the CSV/print walk uses exactly these, in this order). Extra per-op
+    # scalars (e.g. intra_read_cyc) are stored on the row but kept OUT of this list.
+    ORDER = [
+        "go",
+        "read issued",
+        "first read return",
+        "read skew (last core 1st return)",
+        "first core reads complete",
+        "last core reads complete",
+        "first core last write issued",
+        "first core last write flushed",
+        "first core barrier done",
+        "last core last write issued",
+        "last core last write flushed",
+        "last core barrier done",
+        "go received",
     ]
     rows = []  # one per aligned op instance: dict of timeline timestamps
     for i in range(n):
@@ -100,6 +123,7 @@ def main():
         go = col("go")
         rb = col("READ_BEFORE_BARRIER")
         ra = col("READ_AFTER_BARRIER")
+        rl = col("READ_LAST_BARRIER")
         wi = col("WRITE_LAST_ISSUED")
         wf = col("WRITE_LAST_FLUSHED")
         wb = col("WRITE_AFTER_BARRIER")
@@ -110,6 +134,10 @@ def main():
                 "read issued": int(rb.min()),
                 "first read return": int(ra.min()),
                 "read skew (last core 1st return)": int(ra.max()),
+                # first/last CORE to finish ALL its reads (min/max of READ_LAST across cores);
+                # the delta between them (below) is the INTER-core read-complete skew.
+                "first core reads complete": int(rl.min()),
+                "last core reads complete": int(rl.max()),
                 "first core last write issued": int(wi.min()),
                 "first core last write flushed": int(wf.min()),
                 "first core barrier done": int(wb.min()),
@@ -117,6 +145,9 @@ def main():
                 "last core last write flushed": int(wf.max()),
                 "last core barrier done": int(wb.max()),
                 "go received": int(gr.min()),
+                # INTRA-core read span (per core: last-read-complete - first-read-return), median
+                # across cores. NOT a timeline event -- kept off ORDER.
+                "intra_read_cyc": float(np.median(rl - ra)),
             }
         )
     cap = args.max_op_us * freq
@@ -125,7 +156,7 @@ def main():
         print(f"no steady-state op instances under {args.max_op_us} us (got {len(rows)} aligned)")
         return 1
 
-    order = list(rows[0].keys())
+    order = ORDER
     # median delta (from prior event) across steady ops, in cycles
     deltas = {}
     for j, ev in enumerate(order):
@@ -145,6 +176,15 @@ def main():
     print(f"read skew (first->last core first-read-return) = {deltas['read skew (last core 1st return)']:,.0f} cyc")
     done_skew = float(np.median([r["last core barrier done"] - r["first core barrier done"] for r in steady]))
     print(f"done skew (first->last core barrier done) = {done_skew:,.0f} cyc")
+    # Read-completion skew decomposition (the point of this run):
+    #   INTER-core = spread across cores of when each finishes ALL its reads (exploitable stagger).
+    #   INTRA-core = a single core's own read span (first-return -> last-return), median across cores
+    #                (the floor: even one core's reads aren't instantaneous).
+    inter_read = float(np.median([r["last core reads complete"] - r["first core reads complete"] for r in steady]))
+    intra_read = float(np.median([r["intra_read_cyc"] for r in steady]))
+    print(f"read INTER-core skew (first->last core reads-complete) = {inter_read:,.0f} cyc")
+    print(f"read INTRA-core span (per-core last-return - first-return, median) = {intra_read:,.0f} cyc")
+    print(f"  inter/intra ratio = {inter_read/intra_read:.2f}" if intra_read > 0 else "  intra=0")
 
     # Persist the timeline: one row per event with delta-from-prior and cumulative-from-go, in
     # both cycles and us (1 cyc = 1/freq us). Appends so a sweep can collect many configs (one
@@ -173,6 +213,20 @@ def main():
                         f"{cum/freq:.4f}",
                     ]
                 )
+            # Trailing derived scalar: intra-core read span (median per core). delta==cum here; it's
+            # not part of the cumulative timeline (inter-core read skew is the delta of the
+            # "last core reads complete" event above).
+            w.writerow(
+                [
+                    args.label,
+                    ncores,
+                    "intra_core_read_span",
+                    f"{intra_read:.0f}",
+                    f"{intra_read:.0f}",
+                    f"{intra_read/freq:.4f}",
+                    f"{intra_read/freq:.4f}",
+                ]
+            )
     return 0
 
 
