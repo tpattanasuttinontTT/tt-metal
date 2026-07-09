@@ -20,6 +20,7 @@ from models.common.utility_functions import hf_cache_layer_kv
 from models.demos.deepseek_v3_d_p.reference.mla_reference import create_mla_reference
 from models.demos.deepseek_v3_d_p.tests.reference_runners import run_reference_mla
 from models.demos.deepseek_v3_d_p.tt.mla import ttMLA
+from models.demos.deepseek_v3_d_p.tt.mla.indexer import resolve_has_indexer
 from models.demos.deepseek_v3_d_p.tt.mla.rope import RotarySetup
 from models.demos.deepseek_v3_d_p.tt.mla.utils import (
     blockcyclic_cache_host,
@@ -93,7 +94,25 @@ def run_mla_inference(
         layer_num=1,
     )
     rope_setup = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=is_balanced)
-    rope_tensors = rope_setup.get_rope_tensors(seq_len)
+    # Sparse (DSA) single-shot is folded onto the block-cyclic path (one full-seq chunk at offset 0):
+    # it uses the indexed rope tables and a caller-owned indexer key cache, exactly like the chunked
+    # path. Dense keeps natural rope + no index cache.
+    has_indexer = resolve_has_indexer(config)
+    index_kv_cache = None
+    if has_indexer:
+        rope_tensors = rope_setup.get_rope_tensors_indexed(cache_seq_len_global=seq_len, chunk_size_global=seq_len)
+        index_kv_cache = init_kvpe_cache(
+            kvpe_cache_head_dim=config.index_head_dim,
+            mesh_device=mesh_device,
+            seq_len=seq_len,
+            mesh_shape=mesh_shape,
+            sp_axis=sp_axis,
+            num_kvpe_cache_layers=1,
+            num_users=1,
+            dtype=ttnn.bfloat8_b,
+        )
+    else:
+        rope_tensors = rope_setup.get_rope_tensors(seq_len)
 
     # Verify TT MLA exists
     assert mla_tt is not None, "TT MLA should exist"
@@ -134,6 +153,7 @@ def run_mla_inference(
         kvpe_cache=tt_kvpe_cache,
         indexer_indices=inject_indices,
         return_indexer_indices=return_indices,
+        index_kv_cache=index_kv_cache,
     )
     indices = None
     if return_indices:

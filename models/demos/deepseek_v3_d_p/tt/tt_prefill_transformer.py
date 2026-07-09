@@ -21,6 +21,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
+from models.demos.deepseek_v3_d_p.tt.mla.indexer import resolve_has_indexer
 from models.demos.deepseek_v3_d_p.tt.mla.rope import RotarySetup
 from models.demos.deepseek_v3_d_p.tt.mla.utils import create_balanced_chunk_order, reverse_reorder_tensor_chunks
 from models.demos.deepseek_v3_d_p.tt.moe.tt_moe_gate_prefill import GateComputeMode
@@ -246,12 +247,18 @@ class TtPrefillTransformer(LightweightModule):
         # Chunked prefill uses the KV-pad-aware indexed rotated path: whole-cache cos/sin/trans built
         # once here and reused for every chunk (only the runtime kv_actual offset varies). seq_len is
         # the per-chunk size and max_seq_len the full per-user cache length.
+        #
+        # SPARSE (DSA) layers ALWAYS use the indexed rotated path — single-shot is folded onto the
+        # block-cyclic path as one full-seq chunk (chunk_size_global == seq_len), so build the indexed
+        # tables whenever the model is sparse too, not only when chunked. Dense single-shot keeps None
+        # (rotary_embedding_llama via get_rope_tensors).
+        self._has_indexer = resolve_has_indexer(config)
         self.indexed_rope = (
             self.rope_setup.get_rope_tensors_indexed(
                 cache_seq_len_global=max_seq_len if max_seq_len is not None else seq_len,
                 chunk_size_global=seq_len,
             )
-            if is_chunked
+            if (is_chunked or self._has_indexer)
             else None
         )
 
@@ -344,6 +351,10 @@ class TtPrefillTransformer(LightweightModule):
         # is returned, but the chunked caller ignores it (the populated cache is the output).
         if actual_start is not None:
             assert self.is_chunked, "actual_start requires the transformer to be built with is_chunked=True"
+            rope_tensors = self.indexed_rope
+        elif self._has_indexer:
+            # Sparse single-shot is folded onto the block-cyclic path (one full-seq chunk at offset 0),
+            # so it uses the indexed rope tables just like the chunked path.
             rope_tensors = self.indexed_rope
         else:
             rope_tensors = self.rope_setup.get_rope_tensors(self.seq_len)
