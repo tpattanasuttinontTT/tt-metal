@@ -87,9 +87,16 @@ inline void _llk_math_eltwise_unary_sfpu_init_once_()
         .set(ADDR_MOD_7);
 }
 
+// Dependent-false helper: lets the exhaustive-list static_assert below fire only when an uncategorized op is
+// actually instantiated (a plain static_assert(false) in an if-constexpr else branch is ill-formed pre-C++23).
+template <SfpuType>
+inline constexpr bool _sfpu_op_addrmod_unsupported_ = false;
+
 // Per-op ADDR_MOD_6 programming, split out of eltwise_unary_sfpu_configure_addrmod() (which also sets the now
-// hoisted ADDR_MOD_7). Only the ops listed below need a non-default ADDR_MOD_6; for every other op this is a
-// no-op. Consumed by the self-contained per-op init (ckernel::sfpu::_init_<op>_).
+// hoisted ADDR_MOD_7). Exhaustively categorizes every op that uses the self-contained init path
+// (ckernel::sfpu::_init_<op>_): ops needing a non-default ADDR_MOD_6 set it here, ops that need none are listed
+// explicitly, and any uncategorized op is a compile error -- so converting a new op forces a conscious
+// ADDR_MOD_6 decision instead of silently defaulting.
 template <SfpuType sfpu_op>
 inline void _llk_math_eltwise_unary_sfpu_configure_op_addrmod_()
 {
@@ -102,8 +109,7 @@ inline void _llk_math_eltwise_unary_sfpu_configure_op_addrmod_()
         }
             .set(ADDR_MOD_6);
     }
-
-    if constexpr (
+    else if constexpr (
         sfpu_op == SfpuType::reciprocal || sfpu_op == SfpuType::typecast || sfpu_op == SfpuType::unary_max || sfpu_op == SfpuType::unary_min ||
         sfpu_op == SfpuType::unary_max_int32 || sfpu_op == SfpuType::unary_min_int32 || sfpu_op == SfpuType::unary_max_uint32 ||
         sfpu_op == SfpuType::unary_min_uint32 || sfpu_op == SfpuType::signbit || sfpu_op == SfpuType::equal_zero || sfpu_op == SfpuType::not_equal_zero ||
@@ -116,5 +122,16 @@ inline void _llk_math_eltwise_unary_sfpu_configure_op_addrmod_()
             .dest = {.incr = 2},
         }
             .set(ADDR_MOD_6);
+    }
+    else if constexpr (sfpu_op == SfpuType::abs || sfpu_op == SfpuType::exponential || sfpu_op == SfpuType::hardsigmoid)
+    {
+        // Converted ops that need no non-default ADDR_MOD_6.
+    }
+    else
+    {
+        static_assert(
+            _sfpu_op_addrmod_unsupported_<sfpu_op>,
+            "SFPU op is not categorized for the self-contained init ADDR_MOD_6 path. Add it to the topk / "
+            "dest-incr-2 / no-ADDR_MOD_6 list in _llk_math_eltwise_unary_sfpu_configure_op_addrmod_.");
     }
 }
