@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
+#include "api/dataflow/endpoints.h"
 #include "api/dataflow/circular_buffer.h"
 #include "api/core_local_mem.h"
 #include "api/tensor/noc_traits.h"
@@ -310,13 +311,16 @@ void kernel_main() {
                     noc_semaphore_wait(in0_sender_semaphore_addr_ptr, 1);
                     noc_semaphore_set(in0_sender_semaphore_addr_ptr, 0);
 
-                    uint64_t in0_unicast_data_addr = get_noc_addr(in0_dest_noc_x, in0_dest_noc_y, in0_start_address);
-
                     /**
                      * in0 is M_block_tiles x K_block_tiles. When M block is partial, we don't need to write the
                      * padded tiles. Use `current_block_bytes`.
                      */
-                    noc_async_write(in0_start_address, in0_unicast_data_addr, current_block_bytes);
+                    noc.async_write(
+                        CoreLocalMem<uint32_t>(in0_start_address),
+                        UnicastEndpoint{},
+                        current_block_bytes,
+                        {},
+                        {.noc_x = in0_dest_noc_x, .noc_y = in0_dest_noc_y, .addr = in0_start_address});
 
 #ifdef ARCH_BLACKHOLE
                     noc.async_writes_flushed();

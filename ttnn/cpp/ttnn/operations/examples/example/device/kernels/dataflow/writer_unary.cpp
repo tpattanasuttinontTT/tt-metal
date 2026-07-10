@@ -3,8 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/endpoints.h"
+#include "api/core_local_mem.h"
 
 void kernel_main() {
+    Noc noc;
+
     uint32_t dst_addr = get_arg_val<uint32_t>(0);
     uint32_t dst_noc_x = get_arg_val<uint32_t>(1);
     uint32_t dst_noc_y = get_arg_val<uint32_t>(2);
@@ -17,11 +22,14 @@ void kernel_main() {
     uint32_t ublock_size_tiles = 1;
 
     for (uint32_t i = 0; i < num_tiles; i += ublock_size_tiles) {
-        uint64_t dst_noc_addr = get_noc_addr(dst_noc_x, dst_noc_y, dst_addr);
-
         cb_wait_front(cb_id_out0, ublock_size_tiles);
         uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
-        noc_async_write(l1_read_addr, dst_noc_addr, ublock_size_bytes);
+        noc.async_write(
+            CoreLocalMem<uint32_t>(l1_read_addr),
+            UnicastEndpoint{},
+            ublock_size_bytes,
+            {},
+            {.noc_x = dst_noc_x, .noc_y = dst_noc_y, .addr = dst_addr});
 
         noc_async_write_barrier();
 
