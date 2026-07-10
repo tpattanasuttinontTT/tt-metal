@@ -8,7 +8,9 @@
 #if defined(TRISC_MATH) || defined(TRISC_PACK)
 #include "ckernel_sfpu_exp.h"
 #include "llk_math_eltwise_unary_sfpu_macros.h"
+#ifndef ARCH_QUASAR
 #include "ckernel_sfpu_selfcontained_init.h"
+#endif
 #endif
 
 namespace ckernel {
@@ -36,10 +38,17 @@ template <
     uint32_t scale = 0x3F800000,
     InputClamping input_clamping = InputClamping::ClampToNegative>
 ALWI void exp_tile_init() {
+#ifdef ARCH_QUASAR
+    MATH(SFPU_UNARY_INIT_FN(
+        exponential,
+        sfpu::exp_init,
+        (approx, scale, (input_clamping == InputClamping::ClampToNegative), DST_ACCUM_MODE)));
+#else
     MATH(SFPU_UNARY_INIT_SC_FN(
         exponential,
         sfpu::_init_exp_,
         (approx, scale, (input_clamping == InputClamping::ClampToNegative), DST_ACCUM_MODE)));
+#endif
 }
 
 // clang-format off

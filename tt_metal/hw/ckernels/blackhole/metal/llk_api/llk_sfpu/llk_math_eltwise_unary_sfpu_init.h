@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <utility>
+
 #include "llk_sfpu_types.h"
 #include "llk_math_eltwise_unary_sfpu.h"
 
@@ -11,7 +13,8 @@ namespace ckernel {
 
 // Kernel-invariant SFPU init wrapper. Runs the once-per-kernel SFPU setup (SFPU config register + invariant
 // ADDR_MOD_7). Wired into every metal "full init" entry point (compute_kernel_hw_startup, init_sfpu,
-// unary_op_init_common) so it is guaranteed to run exactly once before any SFPU op init on the kernel.
+// unary_op_init_common, binary_op_init_common). It is idempotent; a kernel may reach more than one entry
+// point, so it runs at least once before any SFPU op init on the kernel.
 inline void llk_math_sfpu_init_once() { _llk_math_eltwise_unary_sfpu_init_once_(); }
 
 // -------------------------------------------------------------------------------------------------
@@ -43,9 +46,9 @@ inline void llk_math_eltwise_unary_sfpu_init(F&& init_func, ARGS&&... args) {
 // body of its old init callback. This overload dispatches straight to that functor with NO generic-init
 // prefix -- everything the op needs (minus the hoisted once-init) is inside the functor.
 // -------------------------------------------------------------------------------------------------
-template <SfpuType sfpu_op, class F, class... ARGS>
+template <SfpuType sfpu_op, typename F, typename... ARGS>
 inline void llk_math_eltwise_unary_sfpu_init_selfcontained(F&& init_func, ARGS&&... args) {
-    init_func(static_cast<ARGS&&>(args)...);
+    init_func(std::forward<ARGS>(args)...);
 }
 
 }  // namespace ckernel
