@@ -75,6 +75,7 @@ class VocabParallelEmbedding(AbstractModuleBase):
         num_embeddings: int,
         embedding_dim: int,
         weight_init: Optional[Callable] = None,
+        sequence_parallel: bool = False,
         axis_name: str = "tp",
     ) -> None:
         super().__init__()
@@ -83,6 +84,7 @@ class VocabParallelEmbedding(AbstractModuleBase):
         self.axis_name = axis_name
         self.cluster_axis = mesh.axis_index(axis_name)
         self.tp_size = mesh.axis_size(axis_name)
+        self.sequence_parallel = sequence_parallel
 
         if num_embeddings % self.tp_size != 0:
             raise ValueError(
@@ -166,7 +168,15 @@ class VocabParallelEmbedding(AbstractModuleBase):
         mask = ttnn.transpose(in_range, 2, 3)
         emb = ttml.ops.binary.mul(emb, ttml.autograd.create_tensor(mask, requires_grad=False))
 
-        # Each token is nonzero on exactly one device; sum reconstructs the full
-        # embedding, replicated across TP. Input ids carry no grad, so backward
-        # simply passes the (already replicated) output grad through unchanged.
+        # Each token is nonzero on exactly one device. Sum across TP reconstructs
+        # the full embedding for every token.
+        if self.sequence_parallel:
+            # SP: fuse that sum with a shard along the sequence (dim 2), so the
+            # embedding enters the first block already sequence-sharded. Backward is
+            # all_gather(seq): the ids carry no grad, so it simply reconstructs the
+            # full-sequence output grad (replicated across TP) for the weight bw.
+            return ttml.ops.distributed.reduce_scatter(emb, 2, self.cluster_axis)
+        # Classic TP: sum reconstructs the full embedding, replicated across TP.
+        # Input ids carry no grad, so backward passes the (already replicated)
+        # output grad through unchanged.
         return ttml.ops.distributed.all_reduce(emb, noop_backward=True, cluster_axis=self.cluster_axis)
