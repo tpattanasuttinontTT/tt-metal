@@ -48,3 +48,6 @@ IS_BLACKHOLE = is_blackhole_galaxy()
 # requires a 2D-torus fabric (FABRIC_1D / FABRIC_1D_RING throw `IndexError: map::at` on the cross-column
 # route). Wormhole keeps main's fabric_config=True.
 DECODE_FABRIC_CONFIG = ttnn.FabricConfig.FABRIC_2D_TORUS_XY if IS_BLACKHOLE else True
+
+# Prefill collectives need the same 2D-torus fabric on Blackhole; Wormhole keeps main's FABRIC_1D_RING.
+PREFILL_FABRIC_CONFIG = ttnn.FabricConfig.FABRIC_2D_TORUS_XY if IS_BLACKHOLE else ttnn.FabricConfig.FABRIC_1D_RING
