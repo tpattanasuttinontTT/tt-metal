@@ -16,7 +16,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TT_METAL_HOME="${TT_METAL_HOME:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}"
 export TT_METAL_DEVICE_PROFILER=1
 cd "${TT_METAL_HOME}" || exit 1  # binary detects root from cwd, not env -> must run from repo root
-BIN="${TT_METAL_HOME}/build_RelWithDebInfo/test/tt_metal/perf_microbenchmark/op_to_op_latency/test_op_to_op_latency"
+# Build dir: honor BUILD_DIR/BIN if set, else pick the first build tree that actually has the binary.
+REL="test/tt_metal/perf_microbenchmark/op_to_op_latency/test_op_to_op_latency"
+if [ -z "${BIN:-}" ]; then
+  for b in "${BUILD_DIR:-}" build_RelWithDebInfo build_Release build; do
+    [ -n "${b}" ] && [ -x "${TT_METAL_HOME}/${b}/${REL}" ] && { BIN="${TT_METAL_HOME}/${b}/${REL}"; break; }
+  done
+fi
+[ -x "${BIN:-}" ] || { echo "ERROR: test_op_to_op_latency binary not found (looked in build_RelWithDebInfo/build_Release/build under ${TT_METAL_HOME}). Set BUILD_DIR or BIN." >&2; exit 1; }
+echo "using BIN=${BIN}" >&2
 PY="${TT_METAL_HOME}/python_env/bin/python3"
 DEC="${SCRIPT_DIR}/decompose_latency_bw.py"
 DEV_CSV="${TT_METAL_HOME}/generated/profiler/.logs/profile_log_device.csv"
