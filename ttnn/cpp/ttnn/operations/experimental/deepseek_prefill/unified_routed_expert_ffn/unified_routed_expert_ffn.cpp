@@ -24,7 +24,9 @@ ttnn::Tensor unified_routed_expert_ffn(
     const std::optional<ttnn::Tensor>& expert_region_offsets,
     const std::optional<uint32_t>& input_m_tiles,
     bool read_x_at_offset,
-    RoutedExpertActivation activation) {
+    RoutedExpertActivation activation,
+    const std::optional<tt::tt_metal::SubDeviceId>& subdevice_id,
+    const std::optional<tt::tt_metal::GlobalSemaphore>& global_semaphore) {
     // Single-op fused per-expert FFN. One device Program runs gate matmul,
     // up matmul, silu, multiply, down matmul as four phases inside the same
     // kernel. The kernel reads counts[global_expert_idx_table[local_expert_id]]
@@ -80,7 +82,9 @@ ttnn::Tensor unified_routed_expert_ffn(
                                           : std::nullopt,
         output,
         expert_region_offsets,
-        activation);
+        activation,
+        subdevice_id,
+        global_semaphore);
 }
 
 ttnn::Tensor unified_routed_expert_moe(
@@ -93,7 +97,9 @@ ttnn::Tensor unified_routed_expert_moe(
     const std::vector<ttnn::Tensor>& down_projs,
     uint32_t max_dispatched_tokens_per_expert,
     const std::optional<const ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
-    RoutedExpertActivation activation) {
+    RoutedExpertActivation activation,
+    const std::optional<tt::tt_metal::GlobalSemaphore>& global_semaphore,
+    const std::optional<tt::tt_metal::SubDeviceId>& subdevice_id) {
     TT_FATAL(
         gate_projs.size() == up_projs.size() && gate_projs.size() == down_projs.size(),
         "gate/up/down projection lists must have the same length (got {}, {}, {})",
@@ -149,7 +155,9 @@ ttnn::Tensor unified_routed_expert_moe(
             expert_region_offsets,
             m_tiles,
             /*read_x_at_offset=*/true,
-            activation);
+            activation,
+            subdevice_id,
+            global_semaphore);
     }
     return dispatched_buffer;
 }

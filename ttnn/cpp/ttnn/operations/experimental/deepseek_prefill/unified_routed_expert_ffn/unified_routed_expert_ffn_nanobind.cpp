@@ -8,6 +8,8 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
 
+#include <tt-metalium/sub_device_types.hpp>
+
 #include "ttnn-nanobind/bind_function.hpp"
 #include "unified_routed_expert_ffn.hpp"
 
@@ -77,6 +79,13 @@ void bind_unified_routed_expert_ffn(nb::module_& mod) {
                 (fusing ttnn::extract). Requires expert_region_offsets. Default False.
             activation (ttnn.RoutedExpertActivation, optional):
                 Silu (default, DeepSeek) or SwiGluOai (clamped, MiniMax-M3 / gpt-oss).
+            subdevice_id (ttnn.SubDeviceId, optional): When set, place the
+                compute block at this sub-device's worker-core origin instead of
+                grid origin (0, 0), so the routed expert can overlap the combine
+                on a disjoint sub-device. Defaults to None (origin (0, 0)).
+            global_semaphore (ttnn._ttnn.global_semaphore.global_semaphore, optional):
+                When set, the op increments this semaphore on-device once the
+                expert's output is fully written. Defaults to None (no signaling).
 
         Returns:
             ttnn.Tensor: (M_max, K=emb).
@@ -95,7 +104,9 @@ void bind_unified_routed_expert_ffn(nb::module_& mod) {
         nb::arg("expert_region_offsets") = nb::none(),
         nb::arg("input_m_tiles") = nb::none(),
         nb::arg("read_x_at_offset") = false,
-        nb::arg("activation") = RoutedExpertActivation::Silu);
+        nb::arg("activation") = RoutedExpertActivation::Silu,
+        nb::arg("subdevice_id") = nb::none(),
+        nb::arg("global_semaphore") = nb::none());
 
     ttnn::bind_function<"unified_routed_expert_moe", "ttnn.experimental.deepseek_prefill.">(
         mod,
@@ -128,6 +139,13 @@ void bind_unified_routed_expert_ffn(nb::module_& mod) {
             compute_kernel_config (ttnn.DeviceComputeKernelConfig, optional)
             activation (ttnn.RoutedExpertActivation, optional):
                 Silu (default, DeepSeek) or SwiGluOai (clamped, MiniMax-M3 / gpt-oss).
+            global_semaphore (ttnn._ttnn.global_semaphore.global_semaphore, optional):
+                Used to overlap the routed expert with the combine: each per-expert FFN
+                increments it once its output is written, and the combine waits on it before
+                consuming that expert's region.
+            subdevice_id (ttnn.SubDeviceId, optional):
+                Confines the routed expert to a compute sub-device so it can overlap the combine
+                (which runs on a disjoint sub-device) on separate worker cores.
 
         Returns:
             ttnn.Tensor: expert outputs, same shape as dispatched_buffer.
@@ -143,7 +161,9 @@ void bind_unified_routed_expert_ffn(nb::module_& mod) {
         nb::arg("max_dispatched_tokens_per_expert"),
         nb::kw_only(),
         nb::arg("compute_kernel_config") = nb::none(),
-        nb::arg("activation") = RoutedExpertActivation::Silu);
+        nb::arg("activation") = RoutedExpertActivation::Silu,
+        nb::arg("global_semaphore") = nb::none(),
+        nb::arg("subdevice_id") = nb::none());
 }
 
 }  // namespace ttnn::operations::experimental::deepseek_prefill::unified_routed_expert_ffn::detail

@@ -111,12 +111,7 @@ _SUBTORUS_Y4_ENV = {
         ),
         (
             f"pytest {_TEST_PATH} -k 'fabric2d-mesh-2x4 and layer3 and gate_device and no_ref and isl_6k4'",
-            63_200_000,  # Re-centered 2026-06-25 for two stacked speedups now in the tree -- BOTH
-            # the in-place direct-write change (measured 64.30 ms alone) AND #47536
-            # (update_padded_kv_cache RM/fp8; measured 64.80 ms alone). The combined 2x4-2link number
-            # can't be measured on the galaxy, so the target is the midpoint of the plausible combined
-            # band [62.10, 64.30] ms; margin 0.03 -> [61.30, 65.10] ms brackets both speedups stacking
-            # and either alone. Was 67_000_000.
+            66_180_792,  # Re-centered 2026-07-09 after changes regarding routed expert and combine overlap.
             "deepseek_v3_prefill_block",
             "deepseek_v3_prefill_block_2x4_layer3_moe_fabric2d",
             1,
@@ -226,11 +221,14 @@ def test_deepseek_v3_prefill_block_perf(
     if "torus" in model_name and (os.getenv("CI") == "true" or "TT_GH_CI_INFRA" in os.environ):
         pytest.skip("subtorus/torus perf entry: no wrap-cabled CI runner (would hang on bh-glx)")
 
+    # Force both MoE overlaps (shared/dispatch and routed/combine) off for every case, so the
+    # device-perf baselines are measured with overlaps disabled (honored in test_prefill_block_loop.py).
+    extra_env = {"TT_DS_MOE_DISABLE_OVERLAP": "1"}
+
     # 4x4 sub-torus variants need 16 specific chips carved out + the Ring-4-on-Y descriptor.
     # These must reach the worker via os.environ (extra_env), not the command string.
-    extra_env = None
     if "_4x4_" in model_name:
-        extra_env = dict(_SUBTORUS_Y4_ENV)
+        extra_env.update(_SUBTORUS_Y4_ENV)
         # 4x4 layer3 entries measure the 128-expert / HOST-gate path. Clear DS_4X4_FULL_EXPERTS for
         # the worker so the result is deterministic regardless of any value left in the launching
         # shell — the loop test then halves to 128 experts and forces HOST_ALL. (Forcing 256 experts

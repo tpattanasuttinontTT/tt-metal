@@ -163,26 +163,17 @@ void UnifiedRoutedExpertFfnDeviceOperation::validate_on_program_cache_miss(
         TT_FATAL(
             out.dtype() == t.x.dtype(), "optional_output dtype ({}) must match x dtype ({})", out.dtype(), t.x.dtype());
         const auto& out_shape = out.padded_shape();
-        TT_FATAL(
-            out_shape.rank() == x_shape.rank(),
-            "optional_output rank ({}) must match x rank ({})",
-            out_shape.rank(),
-            x_shape.rank());
-        // Common to both modes: the N (emb) dim and all leading dims must match
-        // x — the writer's tile-row stride is out_shape[-1]/TILE, and leading
-        // dims index the same logical (1,..,1,M,N) tensor.
+        TT_FATAL(out_shape.rank() >= 2, "optional_output must have rank >= 2, got rank {}", out_shape.rank());
         TT_FATAL(
             out_shape[-1] == x_shape[-1],
             "optional_output last dim ({}) must match x last dim ({})",
             out_shape[-1],
             x_shape[-1]);
         for (int i = 0; i < static_cast<int>(out_shape.rank()) - 2; ++i) {
-            TT_FATAL(
-                out_shape[i] == x_shape[i],
-                "optional_output leading dim {} ({}) must match x ({})",
-                i,
-                out_shape[i],
-                x_shape[i]);
+            TT_FATAL(out_shape[i] == 1, "optional_output leading dim {} ({}) must be 1", i, out_shape[i]);
+        }
+        for (int i = 0; i < static_cast<int>(x_shape.rank()) - 2; ++i) {
+            TT_FATAL(x_shape[i] == 1, "x leading dim {} ({}) must be 1", i, x_shape[i]);
         }
         // Mode-specific M (row) dim: direct-write targets the larger shared
         // buffer (M >= x's M, tile-aligned; the writer bounds rows by
@@ -244,7 +235,9 @@ ttnn::Tensor unified_routed_expert_ffn(
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
     const std::optional<ttnn::Tensor>& optional_output,
     const std::optional<ttnn::Tensor>& expert_region_offsets,
-    ttnn::operations::experimental::deepseek_prefill::unified_routed_expert_ffn::RoutedExpertActivation activation) {
+    ttnn::operations::experimental::deepseek_prefill::unified_routed_expert_ffn::RoutedExpertActivation activation,
+    const std::optional<tt::tt_metal::SubDeviceId>& subdevice_id,
+    const std::optional<tt::tt_metal::GlobalSemaphore>& global_semaphore) {
     using OperationType =
         ttnn::operations::experimental::deepseek_prefill::unified_routed_expert_ffn::UnifiedRoutedExpertFfnDeviceOperation;
     return ttnn::device_operation::launch<OperationType>(
@@ -254,7 +247,9 @@ ttnn::Tensor unified_routed_expert_ffn(
             .local_expert_id = local_expert_id,
             .read_x_at_offset = read_x_at_offset,
             .activation = activation,
-            .compute_kernel_config = compute_kernel_config},
+            .compute_kernel_config = compute_kernel_config,
+            .subdevice_id = subdevice_id,
+            .global_semaphore = global_semaphore},
         OperationType::tensor_args_t{
             .x = x,
             .gate_proj = gate_proj,
