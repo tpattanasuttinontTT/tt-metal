@@ -17,6 +17,7 @@
 #include "api/dataflow/circular_buffer.h"
 #include "api/core_local_mem.h"
 #include "ttnn/operations/transformer/sdpa/device/kernels/dataflow/dataflow_common.hpp"
+#include "ttnn/operations/transformer/sdpa/device/kernels/dataflow/block_cyclic_remap.hpp"  // shared invP remap
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_dataflow.hpp"  // block-max-pool: calculate_and_prepare_reduce_scaler
 
 #include "indexer_score_common.hpp"  // shared CB indices, compile-time dims, work-unit walk
@@ -58,16 +59,9 @@ constexpr uint32_t gate_scale_bits = get_compile_time_arg_val(mc_ct_base + 11); 
 // identity -> byte-identical reader binary. Reading K in logical order keeps the causal mask + block-max-pool
 // (both keyed on the logical column) unchanged and yields score columns in natural token order.
 #ifdef BC_ENABLE
-// TODO: unify with ttnn.transformer.sparse_sdpa's logical_to_chunked_physical (sparse_sdpa_gather.hpp) -- same
-// block-cyclic invP; share via a common header later (units differ: tiles here, rows there).
-inline uint32_t logical_to_chunked_physical(
-    uint32_t logical, uint32_t chunk_local, uint32_t sp, uint32_t shard_stride_gap, uint32_t slab_stride_gap) {
-    const uint32_t block_idx = logical / chunk_local;
-    const uint32_t slab = block_idx / sp;          // which global chunk (high part)
-    const uint32_t shard = block_idx - slab * sp;  // which SP shard within the chunk (low part)
-    return logical + shard * shard_stride_gap - slab * slab_stride_gap;
-}
-#define BC_KTILE(L) logical_to_chunked_physical(L, BC_CHUNK_LOCAL_T, BC_SP, BC_SHARD_STRIDE_GAP, BC_SLAB_STRIDE_GAP)
+// Shared block-cyclic invP from block_cyclic_remap.hpp; tiles unit here (sparse_sdpa passes rows, MSA blocks).
+#define BC_KTILE(L) \
+    tt::block_cyclic::logical_to_chunked_physical(L, BC_CHUNK_LOCAL_T, BC_SP, BC_SHARD_STRIDE_GAP, BC_SLAB_STRIDE_GAP)
 #else
 #define BC_KTILE(L) (L)
 #endif
