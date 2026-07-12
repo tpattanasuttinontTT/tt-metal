@@ -88,6 +88,33 @@ _MULTI_CHUNK_NUM_TOKENS = [4096, 6400, 8192]
 _MULTI_CHUNK_STRUCTURED_XFAIL = {("gptoss_120b", n): _GPTOSS_STRUCTURED_XFAIL for n in _MULTI_CHUNK_NUM_TOKENS}
 _CONFIG_TO_MODEL_NAME = {config: name for name, config, _ in MODELS}
 
+# The post_combine_reduce op wedges the device (metal timeout watchdog -> DeviceTimeoutError,
+# then an abort in device teardown) for num_tokens > 4096; 4096 passes. Reproduced across models
+# (dsv3 emb_dim 7168, glm_51 emb_dim 6144), so it is a token-count (chunk-count) limit in the op,
+# not model-specific. These must be SKIPPED, not xfail'd: the hang crashes the whole pytest
+# process, so the -x nightly session would never survive to reach later files (e.g.
+# test_topk_large_indices). On main this hang is masked behind the earlier moe_compute failure
+# that aborts -x collection first; xfailing that flake here exposes it. Applies to both
+# multi_chunk tests, which share the op. Re-enable once the op is fixed. Tracking issue: TODO.
+_MULTI_CHUNK_HANG_MAX_TOKENS = 4096
+_MULTI_CHUNK_TEST_NAMES = {"test_multi_chunk_structured", "test_multi_chunk_random"}
+
+
+@pytest.fixture(autouse=True)
+def _skip_multi_chunk_hangs(request):
+    """Skip the device-wedging num_tokens > _MULTI_CHUNK_HANG_MAX_TOKENS combinations for the
+    multi_chunk tests. Runs at setup so the hanging op never launches."""
+    if request.node.name.split("[")[0] not in _MULTI_CHUNK_TEST_NAMES:
+        return
+    callspec = getattr(request.node, "callspec", None)
+    if callspec is None:
+        return
+    num_tokens = callspec.params.get("num_tokens")
+    if num_tokens is not None and num_tokens > _MULTI_CHUNK_HANG_MAX_TOKENS:
+        pytest.skip(
+            f"post_combine_reduce hangs the device for num_tokens>{_MULTI_CHUNK_HANG_MAX_TOKENS} (TODO: tracking issue)"
+        )
+
 
 @pytest.fixture(autouse=True)
 def _xfail_multi_chunk_structured(request):

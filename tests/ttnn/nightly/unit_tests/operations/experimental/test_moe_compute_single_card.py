@@ -537,6 +537,14 @@ def test_moe_compute_single_card_deepseek(mesh_device, mesh_shape, has_bias):
 # GPT-OSS canonical config from the GPT-OSS entry in `_MODELS_1x8` (test_moe_compute_6U.py):
 #   experts_per_device=4, has_bias=True, activation=SWIGLU.
 # Ring-aware width dim: N=12 (WH) → width=3; N=8 (BH) → width=2 (90%3==0 but 8%3≠0).
+#
+# Unstable on the Blackhole P100 nightly: the matmul output verification intermittently
+# returns near-zero PCC (same failure mode as the deepseek variant above). Tracked in
+# tenstorrent/tt-metal#45794. xfail (non-strict) so the boards where it passes still report.
+@pytest.mark.xfail(
+    reason="Unstable matmul verification on Blackhole P100 nightly, tracked in #45794",
+    strict=False,
+)
 @pytest.mark.parametrize(
     "device_params",
     [
