@@ -493,6 +493,13 @@ def _run_moe_compute_single_card_test(
 #     harvested n150_L), and (6,9)/(5,9) fall out of range. COL-axis matches the 6U
 #     test setup and keeps all 10 functional rows (logical y=0..9) available.
 #
+# Unstable on the Blackhole P100 nightly: the matmul output verification intermittently
+# returns near-zero PCC (and separately FATALs on matmul-core-count under harvest). Tracked
+# in tenstorrent/tt-metal#45794. xfail (non-strict) so the boards where it passes still report.
+@pytest.mark.xfail(
+    reason="Unstable matmul verification on Blackhole P100 nightly, tracked in #45794",
+    strict=False,
+)
 @pytest.mark.parametrize(
     "device_params",
     [

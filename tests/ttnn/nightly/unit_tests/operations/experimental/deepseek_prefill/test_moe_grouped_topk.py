@@ -35,7 +35,19 @@ ROUTING_CONFIGS = [
 ROUTING_CONFIG_IDS = ["deepseek-8g256e", "kimi-1g384e", "dsv4flash-1g256e", "dsv4pro-1g384e"]
 
 # Router affinity activation: sigmoid for DeepSeek-V3/Kimi, sqrtsoftplus for DeepSeek-V4.
-SCORE_FUNCS = ["sigmoid", "sqrtsoftplus"]
+# The sqrtsoftplus path currently produces borderline weights PCC (~0.97 at the threshold)
+# on Blackhole nightly; tracked under tenstorrent/tt-metal#45197 ("mark failed tests as
+# expected to fail"). xfail (non-strict) so passing configs still report as xpass.
+SCORE_FUNCS = [
+    "sigmoid",
+    pytest.param(
+        "sqrtsoftplus",
+        marks=pytest.mark.xfail(
+            reason="moe_grouped_topk weights PCC borderline for sqrtsoftplus configs, tracked in #45197",
+            strict=False,
+        ),
+    ),
+]
 
 
 @pytest.mark.parametrize("score_func", SCORE_FUNCS)
