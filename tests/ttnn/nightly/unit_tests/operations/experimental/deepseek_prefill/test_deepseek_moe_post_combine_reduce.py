@@ -88,31 +88,44 @@ _MULTI_CHUNK_NUM_TOKENS = [4096, 6400, 8192]
 _MULTI_CHUNK_STRUCTURED_XFAIL = {("gptoss_120b", n): _GPTOSS_STRUCTURED_XFAIL for n in _MULTI_CHUNK_NUM_TOKENS}
 _CONFIG_TO_MODEL_NAME = {config: name for name, config, _ in MODELS}
 
-# The post_combine_reduce op wedges the device (metal timeout watchdog -> DeviceTimeoutError,
-# then an abort in device teardown) for num_tokens > 4096; 4096 passes. Reproduced across models
-# (dsv3 emb_dim 7168, glm_51 emb_dim 6144), so it is a token-count (chunk-count) limit in the op,
-# not model-specific. These must be SKIPPED, not xfail'd: the hang crashes the whole pytest
-# process, so the -x nightly session would never survive to reach later files (e.g.
-# test_topk_large_indices). On main this hang is masked behind the earlier moe_compute failure
-# that aborts -x collection first; xfailing that flake here exposes it. Applies to both
-# multi_chunk tests, which share the op. Re-enable once the op is fixed. Tracking issue: TODO.
-_MULTI_CHUNK_HANG_MAX_TOKENS = 4096
+# These combinations wedge the device (metal timeout watchdog -> DeviceTimeoutError, then an abort
+# in device teardown). Root cause pinned via watcher + tt-triage (NOC1): the hang is NOT in the
+# post_combine_reduce op -- all worker cores are idle (the op never launches). It is the *input
+# tensor upload* (`to_device(combine)`) via fast dispatch: writing a single large interleaved DRAM
+# buffer, the prefetcher's `process_relay_linear_cmd` issues a NOC0 read-with-trid that never
+# completes (noc_reads_num_issued 34825 vs RD_RESP_RECEIVED 34820), so
+# `noc_async_read_barrier_with_trid` blocks forever, back-pressuring cq_dispatch's
+# `process_write_paged` and starving the workers. It reproduces with `from_torch(...DRAM)` alone,
+# no op involved. Threshold is the buffer SIZE, not the token count: the `combine` tensor is
+# [1, num_tokens, NUM_EXPERTS, emb_dim] bf16; 448 MiB (dsv3 @ 4096 tokens) uploads fine, ~512 MiB
+# (dsv3 @ 4680) and up hang. So skip any combination whose combine upload exceeds the last
+# known-good size. This must be a SKIP, not xfail: the hang crashes the whole pytest process, so
+# the -x nightly session would never survive to reach later files (e.g. test_topk_large_indices).
+# On main this is masked behind the earlier moe_compute failure that aborts -x collection first;
+# xfailing that flake here exposes it. Applies to both multi_chunk tests. Tracking issue: TODO
+# (fast-dispatch large single-buffer DRAM write hang, ~>=512 MiB).
+_MULTI_CHUNK_HANG_MAX_UPLOAD_BYTES = 4096 * NUM_EXPERTS * 7168 * 2  # 448 MiB: dsv3 @ 4096, last known-good
 _MULTI_CHUNK_TEST_NAMES = {"test_multi_chunk_structured", "test_multi_chunk_random"}
 
 
 @pytest.fixture(autouse=True)
 def _skip_multi_chunk_hangs(request):
-    """Skip the device-wedging num_tokens > _MULTI_CHUNK_HANG_MAX_TOKENS combinations for the
-    multi_chunk tests. Runs at setup so the hanging op never launches."""
+    """Skip multi_chunk combinations whose `combine` input upload exceeds the fast-dispatch
+    large-write hang threshold. Runs at setup so the hanging upload never happens."""
     if request.node.name.split("[")[0] not in _MULTI_CHUNK_TEST_NAMES:
         return
     callspec = getattr(request.node, "callspec", None)
     if callspec is None:
         return
     num_tokens = callspec.params.get("num_tokens")
-    if num_tokens is not None and num_tokens > _MULTI_CHUNK_HANG_MAX_TOKENS:
+    config = callspec.params.get("config")
+    if num_tokens is None or config is None:
+        return
+    combine_bytes = num_tokens * NUM_EXPERTS * config.EMB_SIZE * 2  # bf16 combine [1, T, E, emb]
+    if combine_bytes > _MULTI_CHUNK_HANG_MAX_UPLOAD_BYTES:
         pytest.skip(
-            f"post_combine_reduce hangs the device for num_tokens>{_MULTI_CHUNK_HANG_MAX_TOKENS} (TODO: tracking issue)"
+            f"combine input upload is {combine_bytes / 1024 / 1024:.0f} MiB; fast dispatch hangs on "
+            f"large single-buffer DRAM writes (>~512 MiB) — TODO: tracking issue"
         )
 
 
