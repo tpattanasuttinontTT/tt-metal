@@ -1125,6 +1125,13 @@ def run_chunked_transformer_no_pcc(
     # count to ~n_chunks*num_layers regardless of num_iters. The per-layer MLA/MOE markers inside come
     # from TtPrefillBlock. Requires num_iters >= 2 (iter 0 compiles).
     _signpost_profiling = os.environ.get("TT_PREFILL_BLOCK_SIGNPOST", "0") == "1"
+    # The transformer (esp. MoE) emits far more device profiler zones per readback than the on-device L1
+    # profiler buffer holds; left unflushed it overflows and a dropped ZONE_END mis-pairs with a later
+    # program's marker -> "Start and end marker IDs do not match" TT_FATAL at close_mesh_device. Flush the
+    # buffer every chunk via ttnn.ReadDeviceProfiler (needs TT_METAL_PROFILER_MID_RUN_DUMP=1, which the
+    # device-perf driver sets). getattr: the symbol only exists on a profiler-enabled build, so this is a
+    # no-op on a normal build / when not profiling.
+    _read_device_profiler = getattr(ttnn, "ReadDeviceProfiler", None) if _signpost_profiling else None
 
     profiler.start("tt_forward")
     for it in range(num_iters):
@@ -1163,6 +1170,8 @@ def run_chunked_transformer_no_pcc(
             ttnn.synchronize_device(mesh_device)
             ttnn.deallocate(tt_tokens)
             chunk_times.append(time.time() - chunk_start)
+            if _read_device_profiler is not None:
+                _read_device_profiler(mesh_device)  # flush profiler buffer per chunk to avoid overflow
         if _signpost_profiling and it == num_iters - 1:
             signpost("stop")
         iter_total = time.time() - iter_start
@@ -1532,6 +1541,10 @@ def test_glm_prefill_transformer_chunked_device_perf():
         {
             "CI": "false",
             "TT_PREFILL_BLOCK_SIGNPOST": "1",
+            # Enable mid-run profiler dumps so the impl's per-chunk ttnn.ReadDeviceProfiler flush actually
+            # drains the device buffer (else the MoE-heavy transformer overflows it and the marker pairing
+            # breaks at teardown -> "Start and end marker IDs do not match").
+            "TT_METAL_PROFILER_MID_RUN_DUMP": "1",
             "GLM_PERF_LAYERS": layers,
             "GLM_PERF_N_CHUNKS": n_chunks,
             "GLM_PERF_ITERS": num_iters,
