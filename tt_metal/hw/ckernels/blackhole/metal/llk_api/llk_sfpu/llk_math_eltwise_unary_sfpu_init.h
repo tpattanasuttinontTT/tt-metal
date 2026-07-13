@@ -140,6 +140,11 @@ inline void unary_lt_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
 inline void unary_ne_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
 
 inline void unused_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
+inline void typecast_init() {
+    addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6);
+    math::reset_counters(p_setrwc::SET_ABD_F);
+}
+
 }  // namespace sfpu
 
 // Dependent-false helper so the delegate's else-branch static_assert only fires when an uncategorized bare op is
@@ -254,6 +259,8 @@ inline void llk_math_eltwise_unary_sfpu_init() {
         sfpu::unary_ne_init();
     } else if constexpr (sfpu_op == SfpuType::unused) {
         sfpu::unused_init();
+    } else if constexpr (sfpu_op == SfpuType::typecast) {
+        sfpu::typecast_init();
     } else {
         static_assert(
             _sfpu_bare_op_unhandled_<sfpu_op>,
