@@ -209,14 +209,13 @@ constexpr uint32_t dfb_default_num_entries(uint32_t num_p, uint32_t num_c) {
 
 // ---- cross-category program drivers ----
 
-void run_single_dfb_program(
+inline void run_single_dfb_program(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
     experimental::dfb::DataflowBufferConfig& dfb_config,
     DFBPorCType producer_type,
     DFBPorCType consumer_type,
     const CoreRangeSet& core_range_set = CoreRangeSet(CoreRange(CoreCoord(0, 0), CoreCoord(0, 0))),
     std::optional<uint32_t> num_entries_in_buffer = std::nullopt) {
-
     TT_FATAL(
         !(producer_type == DFBPorCType::TENSIX && consumer_type == DFBPorCType::TENSIX),
         "Both producer and consumer cannot be Tensix. At least one must be a DM kernel for NOC transfers.");
