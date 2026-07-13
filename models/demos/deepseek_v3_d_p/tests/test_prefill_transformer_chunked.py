@@ -1174,6 +1174,10 @@ def run_chunked_transformer_no_pcc(
                 _read_device_profiler(mesh_device)  # flush profiler buffer per chunk to avoid overflow
         if _signpost_profiling and it == num_iters - 1:
             signpost("stop")
+            # Final flush AFTER "stop": the per-chunk mid-run dumps drain the region incrementally, so the
+            # trailing "stop" marker must be flushed too or post_process_ops_log finds "start" but no "stop".
+            if _read_device_profiler is not None:
+                _read_device_profiler(mesh_device)
         iter_total = time.time() - iter_start
         iteration_chunk_times.append(chunk_times)
         logger.info(f"iter {it} done ({n_chunks} chunks) in {iter_total:.3f} seconds")
