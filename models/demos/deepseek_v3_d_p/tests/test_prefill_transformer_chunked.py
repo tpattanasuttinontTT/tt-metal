@@ -1043,6 +1043,11 @@ def run_chunked_transformer_no_pcc(
     gc.collect()
     profiler.end("tt_transformer_creation")
 
+    # Sparse (DSA: glm_5_1 / glm_5_2) requires an UNCOMPRESSED bf16/fp8_e4m3 ROW_MAJOR KVPE cache
+    # (sparse_sdpa reads it natively; mla.forward asserts) — NOT the init_kvpe_cache bfloat8_b/TILE
+    # default that dense ring_mla wants. Match the cache format to the path (dense variants keep the
+    # default). Same distinction as run_chunked_transformer.
+    kvpe_dtype_layout = dict(dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT) if resolve_has_indexer(config) else {}
     tt_kvpe_cache = init_kvpe_cache(
         kvpe_cache_head_dim=kvpe_dim,
         mesh_device=mesh_device,
@@ -1051,7 +1056,26 @@ def run_chunked_transformer_no_pcc(
         sp_axis=sp_axis,
         num_kvpe_cache_layers=num_layers,
         num_users=1,
+        **kvpe_dtype_layout,
     )
+
+    # Sparse (DSA) layers read a block-cyclic indexer key cache that is caller-owned and passed into
+    # forward, exactly like the KVPE cache — user-major layer-stacked [num_users*num_layers, 1, T, D_idx],
+    # allocated with the SAME num_kvpe_cache_layers=num_layers. bf8 (half the memory, top-k within bf16
+    # noise). Dense variants get None (dense MLA uses no index cache). Same setup as run_chunked_transformer.
+    tt_index_kv_cache = None
+    if resolve_has_indexer(config):
+        assert getattr(config, "index_head_dim", None) is not None, "sparse config must provide index_head_dim"
+        tt_index_kv_cache = init_kvpe_cache(
+            kvpe_cache_head_dim=config.index_head_dim,
+            mesh_device=mesh_device,
+            seq_len=SEQ_CACHE_NOPCC,
+            mesh_shape=mesh_shape,
+            sp_axis=sp_axis,
+            num_kvpe_cache_layers=num_layers,
+            num_users=1,
+            dtype=ttnn.bfloat8_b,
+        )
 
     # Precompute per-chunk SP-sharded token tiles once (reused across iterations). Chunk-aligned offsets
     # make the block-cyclic rotation degenerate to a plain per-chip reshape.
@@ -1087,6 +1111,7 @@ def run_chunked_transformer_no_pcc(
             actual_end=CHUNK,
             cache_user_id=0,
             return_intermediates=False,
+            index_kv_cache=tt_index_kv_cache,
         )
         ttnn.synchronize_device(mesh_device)
         ttnn.deallocate(warm_tokens)
@@ -1119,6 +1144,7 @@ def run_chunked_transformer_no_pcc(
                 actual_end=kv_actual + CHUNK,
                 cache_user_id=0,
                 return_intermediates=False,
+                index_kv_cache=tt_index_kv_cache,
             )
             ttnn.synchronize_device(mesh_device)
             ttnn.deallocate(tt_tokens)
@@ -1266,4 +1292,69 @@ def test_ds_prefill_transformer_chunked_no_pcc(
         topology,
         num_iters,
         routing_use_l1_small_for_semaphores=False,
+    )
+
+
+# GLM (glm_5_1 / glm_5_2) counterpart of the no-PCC perf sweep: same chunked driver, sparse (DSA) path.
+# Reports end-to-end prefill time — the per-iteration total ("iter {it} done ... in Xs") and the per-chunk
+# median/stddev table — for the two GLM variants at matched ISL (n_chunks x CHUNK) and num_layers. No PCC,
+# no golden-trace dependency (record-only). Uses the GLM fabric payload + on-device fp32 gate + L1_SMALL
+# routing semaphores, exactly like test_glm_prefill_transformer_chunked. glm_5_2 additionally exercises the
+# DSA cross-layer indexer reuse per chunk. Requires the GLM TTNN weight cache (set the variant's cache env).
+@pytest.mark.parametrize(
+    "num_iters", [1, 2, 10, 20, 25], ids=["iters1", "two_iters", "ten_iters", "iters20", "iters25"]
+)
+@pytest.mark.parametrize(
+    "n_chunks",
+    [1, 2, 5, 10, 11, 20],
+    ids=["chunks1", "chunks2", "chunks5", "chunks10", "chunks_eleven", "chunks20"],
+)
+@pytest.mark.parametrize("num_layers", [1, 10, 78], ids=["L1", "L10", "L78"])
+@pytest.mark.parametrize(
+    "mesh_device, device_params, num_links, topology",
+    [
+        pytest.param(
+            (8, 4),
+            {
+                "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+                "fabric_router_config": create_fabric_router_config(max_payload_size=GLM51Config.FABRIC_PAYLOAD_SIZE),
+                # Small L1_SMALL region for the MoE routing all-gather's global semaphores
+                # (use_l1_small_for_semaphores); see test_glm_prefill_transformer_chunked.
+                "l1_small_size": 512,
+            },
+            2,
+            ttnn.Topology.Linear,
+            marks=pytest.mark.requires_mesh_topology(mesh_shape=(8, 4), topology="mesh-8x4"),
+            id="mesh-8x4",
+        ),
+    ],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant", ["glm_5_1", "glm_5_2"], indirect=True, ids=["glm51", "glm52"])
+@pytest.mark.skipif(not is_blackhole(), reason="GLM DSA ops (indexer / sparse SDPA) are Blackhole-only")
+@pytest.mark.timeout(0)
+def test_glm_prefill_transformer_chunked_no_pcc(
+    variant,
+    config_only,
+    mesh_device,
+    device_params,
+    weight_cache_path,
+    num_layers,
+    n_chunks,
+    num_iters,
+    num_links,
+    topology,
+):
+    run_chunked_transformer_no_pcc(
+        variant,
+        config_only,
+        mesh_device,
+        weight_cache_path,
+        num_layers,
+        n_chunks,
+        GateComputeMode.DEVICE_FP32,
+        num_links,
+        topology,
+        num_iters,
+        routing_use_l1_small_for_semaphores=True,
     )
