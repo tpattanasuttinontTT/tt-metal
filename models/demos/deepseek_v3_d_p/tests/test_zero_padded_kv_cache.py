@@ -7,6 +7,7 @@ Seeds a block-cyclic cache with all-ones, runs the op, reconstructs natural orde
   * [valid_global, ceil_128(v))    zero  (pad window)
   * [ceil_128(v), :)               real (==1)  -- nothing past the window
 """
+
 import math
 
 import pytest
@@ -14,6 +15,7 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.common.utility_functions import is_blackhole
 from models.demos.deepseek_v3_d_p.tt.mla.utils import blockcyclic_positions
 from models.demos.deepseek_v3_d_p.utils.kv_cache_utils import init_kvpe_cache
 
@@ -30,6 +32,128 @@ _CASES = [
     (5120, 10240, 6668, 2),  # chip2 slab1, 4-tile window
 ]
 _IDS = [f"v{v}_chip{ch}" if ch is not None else f"v{v}_aligned" for (_c, _s, v, ch) in _CASES]
+
+
+@pytest.mark.parametrize("mesh_device", [(2, 4)], ids=["2x4"], indirect=True)
+@pytest.mark.parametrize(
+    "dtype,layout",
+    [
+        (ttnn.bfloat8_b, ttnn.TILE_LAYOUT),
+        (ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+        (ttnn.fp8_e4m3, ttnn.ROW_MAJOR_LAYOUT),
+    ],
+    ids=["bfp8_tile", "bf16_rm", "fp8_rm"],
+)
+@pytest.mark.timeout(0)
+def test_zero_padded_kv_cache_formats(mesh_device, dtype, layout):
+    """Sparse ROW_MAJOR coverage plus a local TILE regression on the same boundary geometry.
+
+    Fill a two-user/two-layer cache entirely with ones through update_padded_kv_cache, then zero two
+    different pad windows on the same structural layer. The first window crosses an SP chip boundary;
+    the second call changes slot_idx and valid_global through the program-cache hit path. Untargeted
+    slots and every row outside the exact windows must remain one.
+    """
+    if dtype == ttnn.fp8_e4m3 and not is_blackhole():
+        pytest.skip("FP8_E4M3 is Blackhole-only")
+
+    sp_axis = 0
+    sp = mesh_device.shape[sp_axis]
+    mesh_shape = list(mesh_device.shape)
+    chunk_size_global = 384  # local=192: [180,256) crosses chip0 -> chip1
+    seq_len_cache = 768
+    head_dim = 64
+    num_users = 3
+    num_layers = 2
+
+    cache = init_kvpe_cache(
+        head_dim,
+        mesh_device,
+        seq_len_cache,
+        mesh_shape,
+        sp_axis,
+        num_kvpe_cache_layers=num_layers,
+        num_users=num_users,
+        dtype=dtype,
+        layout=layout,
+    )
+    assert cache.dtype == dtype
+    assert cache.layout == layout
+    if dtype == ttnn.fp8_e4m3:
+        initialized = ttnn.to_torch(
+            cache,
+            mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=(2, 1), mesh_shape=mesh_device.shape),
+        ).float()
+        assert torch.count_nonzero(initialized) == 0
+
+    # Build one globally sharded chunk of ones. FP8 cannot enter through this mesh-mapper path
+    # directly, so create BF16 row-major and typecast on device (the production MLA path does the same).
+    ones = torch.ones(1, 1, chunk_size_global, head_dim, dtype=torch.bfloat16)
+    tt_ones = ttnn.from_torch(
+        ones,
+        device=mesh_device,
+        dtype=ttnn.bfloat16 if dtype == ttnn.fp8_e4m3 else dtype,
+        layout=layout,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_shape), dims=(2, None)),
+    )
+    if dtype == ttnn.fp8_e4m3:
+        tt_ones = ttnn.typecast(tt_ones, ttnn.fp8_e4m3)
+
+    # Two chunk writes fill every physical cache row with one for every (user, layer) slot.
+    for slot_idx in range(num_users):
+        for layer_idx in range(num_layers):
+            for kv_actual_global in (0, chunk_size_global):
+                ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
+                    cache,
+                    tt_ones,
+                    slot_idx=slot_idx,
+                    layer_idx=layer_idx,
+                    num_layers=num_layers,
+                    kv_actual_global=kv_actual_global,
+                    cluster_axis=sp_axis,
+                )
+
+    mesh_device.enable_program_cache()
+    cache_entries_before = mesh_device.num_program_cache_entries()
+    windows = {
+        (0, 1): (180, 256),  # crosses chip0 -> chip1
+        (1, 1): (350, 384),  # ends exactly at a block-cyclic slab boundary
+        (2, 1): (430, 512),  # program-cache hit in the next slab
+    }
+    for (slot_idx, layer_idx), (valid_global, _pad_end) in windows.items():
+        ttnn.experimental.deepseek_prefill.zero_padded_kv_cache(
+            cache,
+            slot_idx,
+            layer_idx,
+            num_layers,
+            valid_global,
+            chunk_size_global,
+            sp_axis,
+            128,
+        )
+    ttnn.synchronize_device(mesh_device)
+
+    cache_sr = ttnn.to_torch(
+        cache,
+        mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=(2, 1), mesh_shape=mesh_device.shape),
+    ).to(torch.bfloat16)[:, :1]
+    positions = blockcyclic_positions(sp, chunk_size_global, seq_len_cache)
+    for slot_idx in range(num_users):
+        for layer_idx in range(num_layers):
+            batch_idx = slot_idx * num_layers + layer_idx
+            natural = torch.empty(seq_len_cache, head_dim, dtype=torch.bfloat16)
+            natural[positions] = cache_sr[batch_idx, 0]
+            expected = torch.ones_like(natural)
+            if (slot_idx, layer_idx) in windows:
+                start, end = windows[(slot_idx, layer_idx)]
+                expected[start:end] = 0
+            assert torch.equal(natural, expected), (
+                f"{layout} {dtype} cache mismatch for slot={slot_idx}, layer={layer_idx}; "
+                f"min={natural.min().item()} max={natural.max().item()}"
+            )
+
+    # The two calls share structural args and layer_idx, so slot/valid changes must reuse one program.
+    assert mesh_device.num_program_cache_entries() == cache_entries_before + 1
 
 
 @pytest.mark.parametrize("mesh_device", [(8, 4)], ids=["8x4"], indirect=True)
