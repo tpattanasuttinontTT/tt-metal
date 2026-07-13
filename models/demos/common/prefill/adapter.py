@@ -69,6 +69,9 @@ class PrefillRunParams:
     weight_cache_path: Optional[Path]
     sp_axis: int = 0
     tp_axis: int = 1
+    # Explicit semantic cache format selected by model/module configuration. Scaled FP8 is a packed
+    # mixed-format row, so it must not be represented or inferred as a bare tensor dtype.
+    sparse_kv_cache_format: Optional[object] = None
 
     @property
     def sp_factor(self) -> int:
@@ -80,14 +83,13 @@ class PrefillRunParams:
 
 
 class KvCaches(tuple):
-    """The device KV cache(s) a prefill model owns, returned by ``allocate_kv_cache`` as an ORDERED
-    tuple of tensors. Callers index positionally:
+    """The device KV cache objects a prefill model owns, returned by ``allocate_kv_cache`` as an
+    ORDERED tuple. Callers index positionally:
 
       * ``kv_caches[0]`` — ALWAYS the primary KV cache (the MLA KVPE cache for the DeepSeek-V3 family).
       * ``kv_caches[1:]`` — any SECONDARY caches the model also owns. A sparse-attention (DSA) model
-        like GLM-5.1 puts its lightning-indexer block-cyclic key cache at index 1, so the engine can
-        build a single MERGED migration table over both (config 0 = KVPE, config 1 = index). A dense
-        model returns just ``KvCaches([kvpe])`` (length 1).
+        like GLM-5.1 puts its lightning-indexer block-cyclic key cache at index 1. Its primary cache
+        may itself be a typed cache wrapper. A dense model returns just ``KvCaches([kvpe])`` (length 1).
 
     A tuple rather than a bare tensor plus optional allocate hooks: every model implements the same
     single ``allocate_kv_cache`` and just returns as many caches as it owns — a model that grows a
@@ -135,6 +137,19 @@ class PrefillModelAdapter(ABC):
     def load_hf_config(self) -> "PretrainedConfig":
         """Load (and normalize) the HF config from PREFILL_HF_MODEL (falling back
         to ``hf_model_default``). The runner sets ``max_seq_len`` on the result."""
+
+    @property
+    def default_sparse_kv_cache_format(self) -> Optional[object]:
+        """Semantic primary-cache format used when the runner builds ``PrefillRunParams``.
+
+        Models with a format choice override this property. Direct module users can instead put
+        an explicit format in ``PrefillRunParams.sparse_kv_cache_format``.
+        """
+        return None
+
+    def resolve_sparse_kv_cache_format(self, requested: Optional[object]) -> Optional[object]:
+        """Return an explicit request, otherwise this adapter's model default."""
+        return self.default_sparse_kv_cache_format if requested is None else requested
 
     @abstractmethod
     def weight_cache_path(self, mesh_shape: tuple) -> Optional[Path]:
