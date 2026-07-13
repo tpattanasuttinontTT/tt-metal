@@ -1113,6 +1113,11 @@ def run_chunked_transformer_no_pcc(
     quiet_log_ns = ("models.demos.deepseek_v3_d_p.tt", "tracy")
     for ns in quiet_log_ns:
         logger.disable(ns)
+    if os.environ.get("TT_MOE_PROF") == "1":
+        # Re-enable ONLY the block module so its per-layer [MOE-PROF] line survives the broad disable
+        # above. loguru resolves activation by longest-matching prefix, so this child override wins over
+        # the disabled parent; the module emits no other forward-path logs, so nothing else leaks back in.
+        logger.enable("models.demos.deepseek_v3_d_p.tt.tt_prefill_block")
     try:
         for it in range(num_iters):
             iter_start = time.time()
@@ -1127,6 +1132,9 @@ def run_chunked_transformer_no_pcc(
                     layout=ttnn.ROW_MAJOR_LAYOUT,
                     mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_shape), dims=(0, None)),
                 )
+                if os.environ.get("TT_MOE_PROF") == "1":
+                    # Marker so the per-layer [MOE-PROF] lines emitted from _moe_path group by (iter, chunk).
+                    logger.info(f"[MOE-PROF] ===== iter={it} chunk={c} kv_actual={kv_actual} =====")
                 chunk_start = time.time()
                 # forward with return_intermediates=False: nothing is cloned to host, no PCC. Chunked
                 # prefill is full-chunk (all positions real) so actual_end is kv_actual + CHUNK; forward

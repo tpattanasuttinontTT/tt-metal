@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
 
@@ -10,6 +11,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
+from models.common.utility_functions import profiler
 from models.demos.deepseek_v3_d_p.tt.mla import ttMLA
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import compute_constants, extract_mesh_config
 from models.demos.deepseek_v3_d_p.tt.moe.tt_moe import TtMoe
@@ -227,6 +229,7 @@ class TtPrefillBlock(LightweightModule):
         tp_topology = topology[1] if isinstance(topology, tuple) else topology
         self.topology = tp_topology  # forward()'s dense-FFN all-gather is on the TP axis (cluster_axis=1)
         self.kv_only = kv_only
+        self.layer_idx = layer_idx
         self.is_moe = layer_idx >= model_cfg.NUM_DENSE_LAYERS
 
         emb_dim = config.hidden_size
@@ -550,12 +553,33 @@ class TtPrefillBlock(LightweightModule):
         """MoE FFN path: 4D TILE → 3D ROW_MAJOR → MoE → 3D TILE → 4D TILE."""
         moe_input = ttnn.squeeze(ffn_norm_out, dim=0)
 
+        # --- MoE profiling ---
+        # Gated on TT_MOE_PROF=1. Bracket the MoE forward with a device sync on each side so the
+        # measured span is pure MoE device+dispatch time for THIS layer, isolated from the rest of
+        # the block (MLA, norms, residuals) and from the next layer's dispatch overlap. The syncs
+        # serialize the layer, so this perturbs end-to-end timing — enable only for profiling.
+        _moe_prof = os.environ.get("TT_MOE_PROF") == "1"
+        _moe_key = f"moe_layer_{self.layer_idx}"
+        if _moe_prof:
+            ttnn.synchronize_device(self.mesh_device)
+            profiler.start(_moe_key)
+
         moe_out, _ = self.ffn(
             moe_input,
             return_intermediates=return_intermediates,
             actual_isl=actual_isl,
             padding_side=padding_side,
         )
+
+        if _moe_prof:
+            ttnn.synchronize_device(self.mesh_device)
+            profiler.end(_moe_key)
+            # profiler.times keeps every per-call sample under _moe_key; [-1] is the one just recorded for
+            # THIS (chunk, layer) call. The no-PCC timed loop does logger.disable("...deepseek_v3_d_p.tt"),
+            # which would swallow this; the test re-enables THIS module by its full name (loguru resolves by
+            # longest-matching prefix, so the child override wins). This module emits no other forward-path
+            # logs, so only these MoE-prof lines come back through.
+            logger.info(f"[MOE-PROF] layer_idx={self.layer_idx} moe_ms={profiler.times[_moe_key][-1] * 1000:.3f}")
 
         moe_out = ttnn.unsqueeze(moe_out, dim=0)
         return moe_out
