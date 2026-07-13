@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DSA Packed FP8 KV Cache — Bottom-up Execution Plan</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101419; --panel:#171d24; --line:#2b3541; --text:#e7edf4;
+      --muted:#a8b3bf; --ok:#62d69b; --accent:#74b9ff; --warn:#f5c26b; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.55 system-ui,sans-serif; }
+    main { max-width:1080px; margin:auto; padding:36px 24px 64px; }
+    h1 { font-size:32px; margin:0 0 8px; } h2 { margin:34px 0 12px; font-size:22px; }
+    h3 { margin:0 0 8px; font-size:17px; } p { margin:7px 0; }
+    .muted { color:var(--muted); } .ok { color:var(--ok); font-weight:650; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; }
+    .card,.stage { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+    .stage { margin:12px 0; } .stage header { display:flex; gap:12px; align-items:baseline; }
+    .badge { color:var(--ok); border:1px solid #317455; border-radius:999px; padding:2px 9px; font-size:12px; }
+    code { color:#b9dcff; background:#0d1116; padding:2px 5px; border-radius:4px; }
+    table { border-collapse:collapse; width:100%; background:var(--panel); }
+    th,td { border:1px solid var(--line); padding:9px 11px; text-align:left; }
+    th { color:var(--muted); } ul { margin:8px 0 0 20px; padding:0; }
+    .flow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0; }
+    .flow span { background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:8px 11px; }
+    .flow b { color:var(--accent); }
+  </style>
+</head>
+<body><main>
+  <h1>DSA packed FP8 KV cache</h1>
+  <p class="muted">Bottom-up, test-driven execution plan and implementation record for DeepSeek V3.2 and GLM-5.1.</p>
+
+  <h2>Final contract</h2>
+  <div class="grid">
+    <div class="card"><h3>BF16 mode</h3><p>One row-major <code>[latent | RoPE]</code> tensor, 576 BF16 values or 1,152 logical bytes per token.</p></div>
+    <div class="card"><h3>Scaled FP8 mode</h3><p>One row-major mixed-format tensor: 512 E4M3 bytes, four FP32 scales, and 64 BF16 RoPE values.</p><p class="ok">656 logical bytes per token</p></div>
+    <div class="card"><h3>Indexer</h3><p>Separate cache owned by DSA, unchanged: <code>bfloat8_b</code> in TILE layout.</p></div>
+  </div>
+  <p>The primary cache has one persistent tensor in either mode. FP8 is a semantic cache format, selected by module/runtime configuration; it is not inferred from a bare dtype and requires no environment variable.</p>
+
+  <div class="flow">
+    <span>BF16 latent</span><b>→</b><span>per-token 128-wide scales</span><b>→</b><span>E4M3 quantize</span><b>→</b><span>pack 656-byte row</span><b>→</b><span>cache update</span><b>→</b><span>sparse gather + scaled SDPA</span>
+  </div>
+
+  <h2>Execution stages</h2>
+  <section class="stage"><header><h3>Stage 0 — CPU feasibility smoke test</h3><span class="badge">complete</span></header>
+    <ul><li>Use a temporary CPU prototype to validate TT-compatible E4M3 encoding, power-of-two per-block scaling, chunk invariance, zero policy, and preserved BF16 RoPE.</li><li>Use the result to establish cache and output PCC gates before implementing device kernels.</li><li>Do not retain a second FP8 reference path: the production tests compare both device cache formats against the canonical BF16 CPU reference, keeping the synthetic suite local and reproducible.</li></ul>
+  </section>
+  <section class="stage"><header><h3>Stage 1 — Storage and movement primitives</h3><span class="badge">complete</span></header>
+    <ul><li>Support row-major BF16/E4M3 in device zero-fill and padded-cache zeroing.</li><li>Support opaque row-major E4M3 copies and padded KV updates.</li><li>Test rotation, partial chunks, multiple slots/layers, program-cache reuse, and raw-byte equality.</li></ul>
+  </section>
+  <section class="stage"><header><h3>Stage 2 — Quantization and packing</h3><span class="badge">complete</span></header>
+    <ul><li>Extend per-token FP8 cast with opt-in upward power-of-two scale rounding and configurable E4M3 maximum.</li><li>Pack latent, scales, and RoPE into one mixed-format row on device.</li><li>Validate shape/dtype/layout and compare every packed byte in the op tests.</li></ul>
+  </section>
+  <section class="stage"><header><h3>Stage 3 — Sparse SDPA consumption</h3><span class="badge">complete</span></header>
+    <ul><li>Gather each packed row once; retain the latent in BFP8 and RoPE in BF16.</li><li>Expand four scales into broadcast tiles and apply them during latent reconstruction.</li><li>Use constexpr compile arguments for cache format and block-cyclic remapping; no feature macros.</li><li>Cover sentinel boundaries, gather-ring wrap, indexed ND-sharded caches, H=64 multi-query tiles, and malformed inputs.</li></ul>
+  </section>
+  <section class="stage"><header><h3>Stage 4 — MLA integration</h3><span class="badge">complete</span></header>
+    <ul><li>Allocate BF16 or packed FP8 through <code>SparseKVCacheFormat</code>; GLM-5.1 defaults to packed FP8.</li><li>Use the same KV stem for full attention and <code>kv_only</code>.</li><li>Update, all-gather, block-cyclic prefix gather, sparse SDPA, and host reconstruction operate on one primary tensor.</li><li>Keep the indexer cache tiled <code>bfloat8_b</code>.</li></ul>
+  </section>
+  <section class="stage"><header><h3>Stage 5 — Serving and migration</h3><span class="badge">complete</span></header>
+    <ul><li>Build one migration-table config for packed KVPE and one for the optional index cache.</li><li>Size chunks from physical buffer pages, including row alignment.</li><li>Decode packed mixed-format rows in the device-less producer PCC path.</li><li>Validate migration/all-gather and both cache formats.</li></ul>
+  </section>
+  <section class="stage"><header><h3>Stage 6 — End-to-end and performance gates</h3><span class="badge">complete</span></header>
+    <ul><li>Run synthetic chunked MLA and <code>kv_only</code> for DeepSeek V3.2 and GLM-5.1.</li><li>Require cache/index PCC and final-output PCC thresholds to pass in both BF16 and packed FP8 modes.</li><li>Profile production H=32 and H=64 op geometries after correctness changes.</li></ul>
+  </section>
+
+  <h2>Measured results</h2>
+  <p class="muted">Measured 2026-07-13 with the warm synthetic perf harness on an 8-chip Blackhole LoudBox, SP=2 × TP=4, FABRIC_2D. The Galaxy targets <code>DS_PERF_CHUNK=5120</code> and <code>DS_PERF_CACHE=51200</code> scale to one 1,280-token chunk beginning at a 12,800-token cache prefix (14,080 total allocated tokens) on LoudBox. Times are device-collapsed critical-path kernel sums; sparse SDPA is included in the full MLA time.</p>
+  <table><thead><tr><th>Variant</th><th>Cache</th><th>Full sparse MLA</th><th>Sparse SDPA</th></tr></thead><tbody>
+    <tr><td>DeepSeek V3.2</td><td>BF16</td><td>10.064 ms</td><td>4.459 ms</td></tr>
+    <tr><td>DeepSeek V3.2</td><td>packed scaled FP8</td><td>8.756 ms</td><td>3.181 ms</td></tr>
+    <tr><td>GLM-5.1</td><td>BF16</td><td>9.036 ms</td><td>1.311 ms</td></tr>
+    <tr><td>GLM-5.1</td><td>packed scaled FP8</td><td>8.801 ms</td><td>1.068 ms</td></tr>
+  </tbody></table>
+  <p>Packed scaled FP8 reduces sparse-SDPA time by 28.7% for DeepSeek V3.2 (1.40×) and 18.5% for GLM-5.1 (1.23×). End-to-end sparse MLA improves by 13.0% and 2.6%, respectively; GLM-5.1 remains dominated by collectives. Reproduce through <code>test_sparse_mla_perf.py::test_mla_chunked_perf</code>; each run writes its commit, branch, device, mesh, fabric, build timestamp, and exact command to <code>run_manifest.json</code>.</p>
+
+  <h2>Required regression gates</h2>
+  <div class="grid">
+    <div class="card"><h3>Op gates</h3><ul><li>FP8 cast scale/value tests</li><li>packed-row byte test</li><li>copy/update/zero-fill tests</li><li>complete sparse-SDPA correctness suite</li></ul></div>
+    <div class="card"><h3>Model gates</h3><ul><li>BF16 and packed FP8 chunked MLA</li><li>DeepSeek and GLM variants</li><li>KVPE and index cache PCC</li><li><code>kv_only</code> cache population</li></ul></div>
+    <div class="card"><h3>Performance gates</h3><ul><li>Run matched BF16 and packed-FP8 cases for DeepSeek V3.2 and GLM-5.1</li><li>packed FP8 sparse SDPA faster than BF16 at both model geometries</li><li>no copy/decode temporary in sparse SDPA</li><li>no permanent profiler zones; retain a manifest for every reported run</li></ul></div>
+  </div>
+</main></body></html>
