@@ -44,6 +44,7 @@ from models.demos.deepseek_v3_d_p.tt.mla.indexer import resolve_has_indexer
 from models.demos.deepseek_v3_d_p.tt.mla.utils import blockcyclic_positions, rotated_chip_positions
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import create_fabric_router_config
 from models.demos.deepseek_v3_d_p.tt.moe.tt_moe_gate_prefill import GateComputeMode
+from models.demos.deepseek_v3_d_p.tt.tt_prefill_block import get_block_timings, reset_block_timings
 from models.demos.deepseek_v3_d_p.tt.tt_prefill_transformer import TtPrefillTransformer
 from models.demos.deepseek_v3_d_p.utils.kv_cache_utils import init_kvpe_cache
 from tests.ttnn.utils_for_testing import comp_pcc
@@ -1152,6 +1153,9 @@ def run_chunked_transformer_no_pcc(
         iter_total = time.time() - iter_start
         iteration_chunk_times.append(chunk_times)
         logger.info(f"iter {it} done ({n_chunks} chunks) in {iter_total:.3f} seconds")
+        # Drop iter 0's per-layer MLA/FFN samples (the compile iteration), same as the chunk-time table.
+        if it == 0:
+            reset_block_timings()
     profiler.end("tt_forward")
 
     profiler.end("total_test_time")
@@ -1161,6 +1165,62 @@ def run_chunked_transformer_no_pcc(
     perf_failures = print_duration_table(iteration_chunk_times)
     for key in profiler.times:
         logger.info(f"  {key}: {profiler.get(key) * 1000:.2f} ms")
+
+    # Rough per-layer MLA-vs-FFN split (TT_PREFILL_BLOCK_TIMING=1): host wall-clock, sync-bracketed, so
+    # absolutes inflate (syncs serialize) — read the RATIO and per-layer shape, not the totals. Median
+    # over all recorded forward calls (iter 0 dropped above). Each layer sample = one chunk's block call.
+    timings = get_block_timings()
+    if timings:
+        headers = ["layer", "mla_ms", "ffn_ms", "mla+ffn_ms", "mla%", "ffn%"]
+        rows = []
+        tot_mla = tot_ffn = 0.0
+        for layer_idx in sorted(timings):
+            rec = timings[layer_idx]
+            mla_ms = statistics.median(rec["mla"]) * 1000.0
+            ffn_ms = statistics.median(rec["ffn"]) * 1000.0
+            both = mla_ms + ffn_ms
+            tot_mla += mla_ms
+            tot_ffn += ffn_ms
+            rows.append(
+                [
+                    f"{layer_idx}",
+                    f"{mla_ms:.2f}",
+                    f"{ffn_ms:.2f}",
+                    f"{both:.2f}",
+                    f"{100.0 * mla_ms / both:.1f}" if both else "-",
+                    f"{100.0 * ffn_ms / both:.1f}" if both else "-",
+                ]
+            )
+        tot_both = tot_mla + tot_ffn
+        rows.append(
+            [
+                "ALL",
+                f"{tot_mla:.2f}",
+                f"{tot_ffn:.2f}",
+                f"{tot_both:.2f}",
+                f"{100.0 * tot_mla / tot_both:.1f}" if tot_both else "-",
+                f"{100.0 * tot_ffn / tot_both:.1f}" if tot_both else "-",
+            ]
+        )
+        widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+        sep = "-+-".join("-" * w for w in widths)
+
+        def render(vals):
+            return " | ".join(v.rjust(widths[i]) for i, v in enumerate(vals))
+
+        n_samples = len(next(iter(timings.values()))["mla"])
+        logger.info(
+            f"per-layer MLA-vs-FFN median host time over {n_samples} calls (sync-bracketed, iter 0 dropped) "
+            f"-- ratio is the signal, absolutes are inflated by the syncs:"
+        )
+        logger.info("\n" + sep)
+        logger.info(render(headers))
+        logger.info(sep)
+        for r in rows[:-1]:
+            logger.info(render(r))
+        logger.info(sep)
+        logger.info(render(rows[-1]))
+        logger.info(sep)
 
     # Assert AFTER the table is logged so the full per-chunk breakdown is always visible on failure.
     assert not perf_failures, "chunk timing out of baseline tolerance:\n  " + "\n  ".join(perf_failures)
