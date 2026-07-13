@@ -9,6 +9,7 @@
 
 #include "ckernel.h"
 #include "ckernel_defs.h"
+#include "llk_math_eltwise_unary_sfpu.h"
 #include "sfpi.h"
 #include "sfpu/ckernel_sfpu_rsqrt_compat.h"
 #include "lltt.h"
@@ -385,6 +386,8 @@ inline void calculate_reciprocal() {
 
 template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool legacy_compat = false>
 void recip_init() {
+    addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6);
+    math::reset_counters(p_setrwc::SET_ABD_F);
     if constexpr (!legacy_compat) {
         if constexpr (APPROXIMATION_MODE) {
             _init_reciprocal_fast_7b_();

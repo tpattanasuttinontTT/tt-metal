@@ -7,6 +7,7 @@
 
 #include "ckernel.h"
 #include "ckernel_defs.h"
+#include "llk_math_eltwise_unary_sfpu.h"
 #include "sfpi.h"
 #include "sfpu/ckernel_sfpu_rsqrt_compat.h"
 using namespace sfpi;
@@ -120,6 +121,7 @@ inline void calculate_reciprocal() {
 
 template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool legacy_compat = false>
 void recip_init() {
+    math::reset_counters(p_setrwc::SET_ABD_F);
     if constexpr (!legacy_compat) {
         sfpu_reciprocal_init<APPROXIMATION_MODE>();
     }

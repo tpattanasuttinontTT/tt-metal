@@ -10,6 +10,7 @@
 #include "sfpi.h"
 #include "ckernel_sfpu_exp.h"
 #include "ckernel_sfpu_recip.h"
+#include "llk_math_eltwise_unary_sfpu.h"
 
 namespace ckernel::sfpu {
 
@@ -78,6 +79,7 @@ inline void calculate_mish() {
 
 template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en>
 inline void mish_init() {
+    math::reset_counters(p_setrwc::SET_ABD_F);
     // exp does not need an init
     recip_init<APPROXIMATION_MODE, is_fp32_dest_acc_en, false>();
 }

@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "ckernel_ops.h"
+#include "llk_math_eltwise_unary_sfpu.h"
 #include "sfpi.h"
 
 namespace ckernel {
@@ -56,6 +57,7 @@ inline void calculate_dropout(uint probability, uint scale) {
 
 template <bool APPROXIMATION_MODE>
 inline void dropout_init(const uint seed) {
+    math::reset_counters(p_setrwc::SET_ABD_F);
     init_prng_seed(seed);
 }
 

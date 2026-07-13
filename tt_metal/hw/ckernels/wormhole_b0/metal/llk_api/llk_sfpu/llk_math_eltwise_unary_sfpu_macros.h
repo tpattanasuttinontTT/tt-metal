@@ -75,24 +75,3 @@ inline __attribute__((always_inline)) void _sfpu_check_(
  */
 #define SFPU_UNARY_INIT_FN_ARGS(OP, INIT_FN, TEMPLATES, ...) \
     ::ckernel::llk_math_eltwise_unary_sfpu_init<::SfpuType::OP>(INIT_FN<_SFPU_EXPAND TEMPLATES>, ##__VA_ARGS__)
-
-/*
- * Self-contained per-op init macros (phase 1 pattern).
- *
- * A converted op supplies a self-contained functor ckernel::sfpu::_init_<op>_ that bakes in its op-dependent
- * ADDR_MOD_6, reset_counters, and old-init-callback body. The op-invariant SFPU config reg + ADDR_MOD_7 are
- * run once per kernel by llk_math_sfpu_init_once() (from the metal full-init entry points), so these macros
- * dispatch straight to the functor with no generic-init prefix. Coexists with the legacy SFPU_UNARY_INIT*
- * macros above; each op uses exactly one form.
- *
- * Bare (no template args on the functor):
- *   SFPU_UNARY_INIT_SC(abs, sfpu::_init_abs_);
- * Templated functor:
- *   SFPU_UNARY_INIT_SC_FN(hardsigmoid, sfpu::_init_hardsigmoid_, (APPROX));
- *   SFPU_UNARY_INIT_SC_FN(exponential, sfpu::_init_exp_, (approx, scale, clamp, DST_ACCUM_MODE));
- */
-#define SFPU_UNARY_INIT_SC(OP, INIT_FN) \
-    ::ckernel::llk_math_eltwise_unary_sfpu_init_selfcontained<::SfpuType::OP>(INIT_FN)
-
-#define SFPU_UNARY_INIT_SC_FN(OP, INIT_FN, TEMPLATES) \
-    ::ckernel::llk_math_eltwise_unary_sfpu_init_selfcontained<::SfpuType::OP>(INIT_FN<_SFPU_EXPAND TEMPLATES>)
