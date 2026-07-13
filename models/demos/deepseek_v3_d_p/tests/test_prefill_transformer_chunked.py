@@ -1316,14 +1316,16 @@ def test_ds_prefill_transformer_chunked_no_pcc(
         pytest.param(
             (8, 4),
             {
-                "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+                # Ring fabric (FABRIC_1D_RING + Topology.Ring): the production transport for the GLM
+                # chunked-prefill perf measurement.
+                "fabric_config": ttnn.FabricConfig.FABRIC_1D_RING,
                 "fabric_router_config": create_fabric_router_config(max_payload_size=GLM51Config.FABRIC_PAYLOAD_SIZE),
                 # Small L1_SMALL region for the MoE routing all-gather's global semaphores
                 # (use_l1_small_for_semaphores); see test_glm_prefill_transformer_chunked.
                 "l1_small_size": 512,
             },
             2,
-            ttnn.Topology.Linear,
+            ttnn.Topology.Ring,
             marks=pytest.mark.requires_mesh_topology(mesh_shape=(8, 4), topology="mesh-8x4"),
             id="mesh-8x4",
         ),
