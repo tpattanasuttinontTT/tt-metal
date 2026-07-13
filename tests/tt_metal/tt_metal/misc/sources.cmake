@@ -2,6 +2,7 @@
 # Module owners should update this file when adding/removing/renaming source files
 
 set(UNIT_TESTS_MISC_SRC
+    test_float8.cpp
     test_tilize_untilize.cpp
     test_executor.cpp
     test_stable_hash.cpp
