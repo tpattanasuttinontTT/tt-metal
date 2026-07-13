@@ -11,6 +11,7 @@
 #include <tt-metalium/experimental/tensor/topology/tensor_topology.hpp>
 
 #include <tt_stl/optional_reference.hpp>
+#include <tt_stl/pimpl.hpp>
 
 // It is intentional to not reflect the experimental status of this header in its namespace,
 // as most of the code movements are based on implementations in TTNN that are well tested and production ready for a
@@ -49,7 +50,7 @@ class MeshBuffer;
  * Note: A moved-from MeshTensor is in a valid but unspecified state. All member functions except destruction and
  * assignment will fail on a moved-from instance.
  */
-class MeshTensor {
+class MeshTensor : public ttsl::PimplBase<MeshTensorImpl> {
 public:
     using volume_type = std::uint64_t;
 
@@ -175,10 +176,9 @@ public:
     /**
      * Access to the implementation.
      *
-     * pre-condition: The MeshTensor must not be in a default constructed state.
+     * pre-condition: The MeshTensor must not be in a moved-from (valueless) state.
      */
-    MeshTensorImpl& impl();
-    const MeshTensorImpl& impl() const;
+    using PimplBase::impl;
 
 private:
     // Internal constructor for transition. Use the from_buffer factory or allocate_on_device
@@ -203,11 +203,6 @@ private:
      * Only accessible to DeviceStorage. See #43693 for removal plan.
      */
     std::shared_ptr<distributed::MeshBuffer> mesh_buffer_invariant_breaking() const;
-
-    // impl_ could be a nullptr if MeshTensor is in a moved-from state.
-    // Avoid using impl_ pointer directly, use the impl() accessor instead.
-    // Otherwise, please add manual TT_FATAL checks for nullptr.
-    std::unique_ptr<MeshTensorImpl> impl_;
 };
 
 }  // namespace tt::tt_metal
