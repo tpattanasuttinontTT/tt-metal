@@ -29,7 +29,7 @@ void kernel_main() {
     constexpr uint32_t k_dim = get_compile_time_arg_val(4);  // q/kv head dim (from the tensor)
 
     // CB ids — passed by the factory (the SparseCB enum is the single source); order must match the
-    // factory's reader CB-arg block (compile args 5..9). cb_kreq/cb_kack come as defines (CB_KREQ/CB_KACK).
+    // factory's reader CB-arg block (compile args 5..9).
     constexpr uint32_t cb_q_rm = get_compile_time_arg_val(5);
     constexpr uint32_t cb_k_rm = get_compile_time_arg_val(6);
     constexpr uint32_t cb_mask_part = get_compile_time_arg_val(7);
@@ -45,10 +45,16 @@ void kernel_main() {
     constexpr uint32_t bc_sp = get_compile_time_arg_val(15);
     constexpr uint32_t bc_shard_stride_gap = get_compile_time_arg_val(16);
     constexpr uint32_t bc_slab_stride_gap = get_compile_time_arg_val(17);
+    constexpr bool scaled_kv = get_compile_time_arg_val(18) != 0;
+    constexpr uint32_t latent_dim = get_compile_time_arg_val(19);
+    constexpr uint32_t cb_k_scale_bcast = get_compile_time_arg_val(20);
+    constexpr uint32_t packed_row_bytes = get_compile_time_arg_val(21);
+    constexpr uint32_t cb_kreq = get_compile_time_arg_val(22);
+    constexpr uint32_t cb_kack = get_compile_time_arg_val(23);
 
     // kv carries a RUNTIME tensor shape (its T dim is common runtime args, not compile-time), so its accessor
     // spans both the compile-time AND common-runtime arg streams. Thread both offsets through all three.
-    constexpr auto q_args = TensorAccessorArgs<18, 0>();
+    constexpr auto q_args = TensorAccessorArgs<24, 0>();
     constexpr auto kv_args =
         TensorAccessorArgs<q_args.next_compile_time_args_offset(), q_args.next_common_runtime_args_offset()>();
     constexpr auto idx_args =
@@ -62,17 +68,19 @@ void kernel_main() {
     // Indexed KV cache: page offset (cache_batch_idx * T) selecting the cache's batch slot; 0 if not indexed.
     const uint32_t kv_batch_page_offset = get_arg_val<uint32_t>(5);
 
-    constexpr uint32_t q_row_bytes = k_dim * q_elem_bytes;     // Q row (bf16)
-    constexpr uint32_t k_row_bytes = k_dim * kv_elem_bytes;    // K row (native dtype: fp8 or bf16)
+    constexpr uint32_t q_row_bytes = k_dim * q_elem_bytes;   // Q row (bf16)
+    constexpr uint32_t k_row_bytes = k_dim * kv_elem_bytes;  // K row (native dtype: fp8 or bf16)
+    constexpr uint32_t latent_row_bytes = latent_dim;
+    constexpr uint32_t scale_blocks = latent_dim / 128;
     constexpr uint32_t idx_row_bytes = topk * idx_elem_bytes;  // one index row
 
     Noc noc;
     experimental::CB q_cb(cb_q_rm), k_cb(cb_k_rm), mask_part_cb(cb_mask_part), idx_cb(cb_idx), ctrl_cb(cb_ctrl);
-    experimental::CB kreq_cb(CB_KREQ), kack_cb(CB_KACK);  // dual-NoC K-gather handoff to the writer
+    experimental::CB kreq_cb(cb_kreq), kack_cb(cb_kack);  // dual-NoC K-gather handoff to the writer
+    experimental::CB scale_bcast_cb(cb_k_scale_bcast);
     const auto q = TensorAccessor(q_args, q_addr);
     const auto kv = TensorAccessor(kv_args, kv_addr);
     const auto idx = TensorAccessor(idx_args, idx_addr);
-
     // Reader-internal scratch for one token's index row (reserved once, reused).
     idx_cb.reserve_back(1);
     const uint32_t idx_l1 = idx_cb.get_write_ptr();
@@ -121,9 +129,97 @@ void kernel_main() {
             const uint32_t base = chunk * k_chunk;
             const uint32_t valid = (nv - base) < k_chunk ? (nv - base) : k_chunk;  // (0, k_chunk]
 
-            // K chunk rows -> cb_k_rm: read the `valid` real keys, zero-fill the sentinel suffix.
-            k_cb.reserve_back(k_chunk);
-            {
+            if constexpr (scaled_kv) {
+                // Stream one 32-row compressed slab at a time. cb_k_rm owns the double-buffered packed FIFO;
+                // cb_k_rope_rm is a format-only BF16 view whose read pointer is derived by compute.
+                constexpr uint32_t row_tiles = k_chunk / tt::constants::TILE_HEIGHT;
+                for (uint32_t row_tile = 0; row_tile < row_tiles; ++row_tile) {
+                    const uint32_t row_base = row_tile * tt::constants::TILE_HEIGHT;
+                    const uint32_t rows = valid > row_base ? ((valid - row_base < tt::constants::TILE_HEIGHT)
+                                                                  ? valid - row_base
+                                                                  : tt::constants::TILE_HEIGHT)
+                                                           : 0;
+                    {
+                        k_cb.reserve_back(tt::constants::TILE_HEIGHT);
+                        scale_bcast_cb.reserve_back(scale_blocks);
+                    }
+                    const uint32_t k_write_ptr = k_cb.get_write_ptr();
+                    const uint32_t scale_write_ptr = scale_bcast_cb.get_write_ptr();
+                    const uint32_t split = rows >> 1;
+                    kreq_cb.reserve_back(1);
+                    {
+                        volatile tt_l1_ptr uint32_t* rq =
+                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kreq_cb.get_write_ptr());
+                        rq[0] = base + row_base;
+                        rq[1] = split;
+                        rq[2] = rows;
+                        rq[3] = (chunk == n_active - 1) && (row_tile == row_tiles - 1);
+                        rq[4] = k_write_ptr;
+                        rq[5] = scale_write_ptr;
+                    }
+                    kreq_cb.push_back(1);
+                    {
+                        sparse_sdpa::trid_ring_gather<
+                            block_cyclic,
+                            bc_chunk_local,
+                            bc_sp,
+                            bc_shard_stride_gap,
+                            bc_slab_stride_gap,
+                            sparse_sdpa::SCALED_K_TRID_RING>(
+                            noc,
+                            kv,
+                            k_write_ptr,
+                            idx_ptr,
+                            base + row_base,
+                            split,
+                            rows,
+                            packed_row_bytes,
+                            kv_batch_page_offset);
+                    }
+                    // Expand the scale rows from the reader's gathered half while the writer handles its
+                    // own half. The two RISCs write disjoint rows of the same FP32 broadcast tiles.
+                    {
+                        volatile tt_l1_ptr uint32_t* scale_tiles =
+                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scale_write_ptr);
+                        volatile tt_l1_ptr uint32_t* packed =
+                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(k_write_ptr);
+                        constexpr uint32_t packed_words = packed_row_bytes / sizeof(uint32_t);
+                        constexpr uint32_t latent_words = latent_row_bytes / sizeof(uint32_t);
+                        for (uint32_t p = split; p < rows; ++p) {
+                            const uint32_t tile_row_offset = p < 16 ? p * 16 : 512 + (p - 16) * 16;
+                            volatile tt_l1_ptr uint32_t* row_scales = packed + p * packed_words + latent_words;
+                            for (uint32_t block = 0; block < scale_blocks; ++block) {
+                                scale_tiles[block * 1024 + tile_row_offset] = row_scales[block];
+                            }
+                        }
+                    }
+                    kack_cb.wait_front(1);
+                    kack_cb.pop_front(1);
+                    if (rows < tt::constants::TILE_HEIGHT) {
+                        noc.async_write_zeros(
+                            k_cb,
+                            (tt::constants::TILE_HEIGHT - rows) * packed_row_bytes,
+                            {.offset_bytes = rows * packed_row_bytes});
+                        noc.write_zeros_l1_barrier();
+                    }
+                    // Zero the scale rows for the padded suffix after both real-row halves have joined.
+                    {
+                        volatile tt_l1_ptr uint32_t* scale_tiles =
+                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scale_write_ptr);
+                        for (uint32_t p = rows; p < tt::constants::TILE_HEIGHT; ++p) {
+                            const uint32_t tile_row_offset = p < 16 ? p * 16 : 512 + (p - 16) * 16;
+                            for (uint32_t block = 0; block < scale_blocks; ++block) {
+                                scale_tiles[block * 1024 + tile_row_offset] = 0;
+                            }
+                        }
+                    }
+                    k_cb.push_back(tt::constants::TILE_HEIGHT);
+                    scale_bcast_cb.push_back(scale_blocks);
+                }
+            } else {
+                // K chunk rows -> cb_k_rm: read the `valid` real keys, zero-fill the sentinel suffix.
+                k_cb.reserve_back(k_chunk);
+                const uint32_t k_write_ptr = k_cb.get_write_ptr();
                 // Dual-NoC split gather: the K-row response data is the op's bottleneck (NoC-link bound, not
                 // DRAM-controller bound), so we spread it across BOTH NoCs. The reader (this NoC) gathers
                 // rows [half,valid); it hands the writer rows [0,half) via cb_kreq, and the writer gathers
@@ -137,12 +233,18 @@ void kernel_main() {
                     rq[0] = base;
                     rq[1] = half;
                     rq[2] = (chunk == n_active - 1);  // writer ends the token's gather phase on the last chunk
+                    rq[3] = k_write_ptr;
                 }
                 kreq_cb.push_back(1);
                 // Reader gathers its half [half, valid) on its NoC (depth-4 trid ring, shared helper).
-                sparse_sdpa::
-                    trid_ring_gather<block_cyclic, bc_chunk_local, bc_sp, bc_shard_stride_gap, bc_slab_stride_gap>(
-                        noc, kv, k_cb, idx_ptr, base, half, valid, k_row_bytes, kv_batch_page_offset);
+                sparse_sdpa::trid_ring_gather<
+                    block_cyclic,
+                    bc_chunk_local,
+                    bc_sp,
+                    bc_shard_stride_gap,
+                    bc_slab_stride_gap,
+                    sparse_sdpa::K_TRID_RING>(
+                    noc, kv, k_write_ptr, idx_ptr, base, half, valid, k_row_bytes, kv_batch_page_offset);
                 kack_cb.wait_front(1);  // writer's half landed in cb_k_rm L1
                 kack_cb.pop_front(1);
                 // Zero-fill the sentinel suffix: masked-key scores become a defined 0 (compute adds -inf).
@@ -150,8 +252,8 @@ void kernel_main() {
                     noc.async_write_zeros(k_cb, (k_chunk - valid) * k_row_bytes, {.offset_bytes = valid * k_row_bytes});
                     noc.write_zeros_l1_barrier();
                 }
+                k_cb.push_back(k_chunk);
             }
-            k_cb.push_back(k_chunk);
 
             // Boundary mask: only the LAST active chunk can have sentinels. Its key tile that straddles
             // `valid` (tile valid/32) needs cols >= valid%32 set to -inf; the tiles after it are fully

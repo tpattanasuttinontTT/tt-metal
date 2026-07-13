@@ -40,6 +40,142 @@ def test_sparse_sdpa_runs(device):
     assert tuple(out.shape) == (1, H, S, V_DIM), f"got {tuple(out.shape)}"
 
 
+@run_for_blackhole()
+@pytest.mark.parametrize(
+    "S,T,TOPK,kc,all_valid,round_scale",
+    [
+        (32, 128, 64, 32, False, True),
+        (32, 128, 64, 64, False, True),
+        (32, 128, 64, 32, True, True),
+        (4, 512, 256, 256, True, True),
+        (4, 128, 64, 32, True, False),
+        (4, 256, 128, 128, False, False),
+    ],
+    ids=[
+        "multi_chunk",
+        "single_chunk",
+        "gather_ring_wrap",
+        "two_slab_pipeline_wrap",
+        "arbitrary_scale",
+        "bfp8_latent_bf16_rope",
+    ],
+)
+def test_sparse_sdpa_scaled_fp8_kv(device, S, T, TOPK, kc, all_valid, round_scale):
+    """Selected FP8 latent rows use per-token/block scales while RoPE remains BF16."""
+    H = 32
+    q, _, indices = make_inputs(
+        H, S, T, TOPK, K_DIM, (lambda s: TOPK) if all_valid else (lambda s: 1 + (s * 7) % TOPK), seed=41
+    )
+    gen = torch.Generator().manual_seed(42)
+    latent = torch.randn(1, 1, T, V_DIM, generator=gen, dtype=torch.float32)
+    latent *= torch.tensor([0.001, 0.01, 0.1, 1.0]).repeat_interleave(128)
+    rope = torch.randn(1, 1, T, K_DIM - V_DIM, generator=gen, dtype=torch.float32).to(torch.bfloat16)
+
+    tt_latent = to_dev(latent.to(torch.bfloat16), device, ttnn.bfloat16)
+    tt_fp8, tt_scales = ttnn.experimental.deepseek_prefill.per_token_cast_to_fp8(
+        tt_latent, round_scale_to_power_of_two=round_scale
+    )
+    tt_rope = to_dev(rope, device, ttnn.bfloat16)
+    tt_packed = ttnn.experimental.deepseek_prefill.pack_scaled_fp8_kv_cache(tt_fp8, tt_scales, tt_rope)
+    tt_q = to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16)
+    tt_idx = to_dev(indices.to(torch.int32), device, ttnn.uint32)
+
+    block_cyclic_args = {"block_cyclic_sp_axis": 0, "block_cyclic_chunk_local": S} if kc == TOPK and TOPK == 64 else {}
+    tt_out = ttnn.transformer.sparse_sdpa(
+        tt_q,
+        tt_packed,
+        tt_idx,
+        V_DIM,
+        scale=K_DIM**-0.5,
+        k_chunk_size=kc,
+        **block_cyclic_args,
+    )
+
+    tt_reconstructed = ttnn.experimental.deepseek_prefill.per_token_cast_back(
+        tt_fp8, tt_scales, output_dtype=ttnn.bfloat16
+    )
+    reconstructed = torch.cat([ttnn.to_torch(tt_reconstructed).float(), rope.float()], dim=-1)
+    expected = golden(q, reconstructed, indices, K_DIM**-0.5, V_DIM)
+    score = pcc(ttnn.to_torch(tt_out), expected)
+    assert score >= 0.999, f"scaled FP8 sparse SDPA PCC {score:.5f}"
+
+
+@run_for_blackhole()
+def test_sparse_sdpa_bf16_multi_query_tile(device):
+    """Two query tiles must pack into distinct score rows when qsb is two."""
+    H, S, T, TOPK, kc = 64, 64, 128, 64, 32
+    q, kv, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: TOPK, seed=60)
+    out, scale = run_op(q, kv, indices, device, k_chunk_size=kc, v_dim=V_DIM)
+    expected = golden(q, kv, indices, scale, V_DIM)
+    score = pcc(out, expected)
+    tile_scores = [pcc(out[:, start : start + 32], expected[:, start : start + 32]) for start in (0, 32)]
+    assert score >= 0.999, f"BF16 H=64 sparse SDPA PCC {score:.5f}; head-tile PCCs {tile_scores}"
+
+
+@run_for_blackhole()
+def test_sparse_sdpa_scaled_fp8_kv_multi_query_tile(device):
+    """GLM geometry: two 32-head query tiles share each gathered packed-KV chunk."""
+    H, S, T, TOPK, kc = 64, 64, 128, 64, 32
+    q, _, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: TOPK, seed=61)
+    gen = torch.Generator().manual_seed(62)
+    latent = torch.randn(1, 1, T, V_DIM, generator=gen, dtype=torch.float32)
+    latent *= torch.tensor([0.001, 0.01, 0.1, 1.0]).repeat_interleave(128)
+    rope = torch.randn(1, 1, T, K_DIM - V_DIM, generator=gen, dtype=torch.float32).to(torch.bfloat16)
+
+    tt_latent = to_dev(latent.to(torch.bfloat16), device, ttnn.bfloat16)
+    tt_fp8, tt_scales = ttnn.experimental.deepseek_prefill.per_token_cast_to_fp8(
+        tt_latent, round_scale_to_power_of_two=True
+    )
+    tt_packed = ttnn.experimental.deepseek_prefill.pack_scaled_fp8_kv_cache(
+        tt_fp8, tt_scales, to_dev(rope, device, ttnn.bfloat16)
+    )
+    out = ttnn.transformer.sparse_sdpa(
+        to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16),
+        tt_packed,
+        to_dev(indices.to(torch.int32), device, ttnn.uint32),
+        V_DIM,
+        scale=K_DIM**-0.5,
+        k_chunk_size=kc,
+    )
+
+    reconstructed_latent = ttnn.experimental.deepseek_prefill.per_token_cast_back(
+        tt_fp8, tt_scales, output_dtype=ttnn.bfloat16
+    )
+    reconstructed = torch.cat([ttnn.to_torch(reconstructed_latent).float(), rope.float()], dim=-1)
+    expected = golden(q, reconstructed, indices, K_DIM**-0.5, V_DIM)
+    actual = ttnn.to_torch(out)
+    score = pcc(actual, expected)
+    tile_scores = [pcc(actual[:, start : start + 32], expected[:, start : start + 32]) for start in (0, 32)]
+    assert score >= 0.999, f"scaled FP8 H=64 sparse SDPA PCC {score:.5f}; head-tile PCCs {tile_scores}"
+
+
+@run_for_blackhole()
+def test_sparse_sdpa_scaled_fp8_rejects_malformed_packed_width(device, expect_error):
+    H, S, T, TOPK = 32, 32, 128, 32
+    q, kv, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: TOPK)
+    malformed = to_dev(torch.randn(1, 1, T, 600), device, ttnn.fp8_e4m3)
+    with expect_error(RuntimeError, "kv must be"):
+        ttnn.transformer.sparse_sdpa(
+            to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16),
+            malformed,
+            to_dev(indices.to(torch.int32), device, ttnn.uint32),
+            V_DIM,
+        )
+
+
+@run_for_blackhole()
+def test_sparse_sdpa_rejects_v_dim_larger_than_k_dim(device, expect_error):
+    H, S, T, TOPK = 32, 32, 128, 32
+    q, kv, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: TOPK)
+    with expect_error(RuntimeError, "v_dim must be in"):
+        ttnn.transformer.sparse_sdpa(
+            to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16),
+            to_dev(kv.to(torch.bfloat16), device, ttnn.bfloat16),
+            to_dev(indices.to(torch.int32), device, ttnn.uint32),
+            K_DIM + 32,
+        )
+
+
 # ---- output dtype matches q (bf16 q -> bf16 out, fp8 q -> fp8 out) ----
 @run_for_blackhole()
 @pytest.mark.parametrize("q_dtype", [ttnn.bfloat16, ttnn.fp8_e4m3], ids=["q_bf16", "q_fp8"])
@@ -210,11 +346,11 @@ def test_sparse_sdpa_indexed_kv_cache(device):
 
 
 # ---- indexed KV cache that is ND-sharded across DRAM banks (each batch slot is one shard). ----
-def _nd_sharded_dram_config(device, rows_per_shard):
+def _nd_sharded_dram_config(device, rows_per_shard, width=K_DIM):
     num_banks = device.dram_grid_size().x
     cores = [ttnn.CoreRange(ttnn.CoreCoord(b, 0), ttnn.CoreCoord(b, 0)) for b in range(num_banks)]
     spec = ttnn.NdShardSpec(
-        shard_shape=[1, 1, rows_per_shard, K_DIM],
+        shard_shape=[1, 1, rows_per_shard, width],
         grid=ttnn.CoreRangeSet(cores),
         orientation=ttnn.ShardOrientation.ROW_MAJOR,
         shard_distribution_strategy=ttnn.ShardDistributionStrategy.ROUND_ROBIN_1D,
@@ -244,6 +380,48 @@ def test_sparse_sdpa_indexed_nd_sharded_kv(device):
         )
         p = pcc(ttnn.to_torch(tt_out), golden(q, kv_full[cb : cb + 1], indices, scale, V_DIM))
         assert p >= 0.99, f"PCC {p:.5f} (nd-sharded, cache_batch_idx={cb})"
+
+
+@run_for_blackhole()
+def test_sparse_sdpa_scaled_fp8_indexed_nd_sharded_kv(device):
+    """Production cache geometry: one packed ND-sharded cache and a dynamic user/layer slot."""
+    H, S, T, TOPK, kc, B = 32, 32, 128, 64, 32, 2
+    scale = K_DIM**-0.5
+    q, _, indices = make_inputs(H, S, T, TOPK, K_DIM, lambda s: TOPK, seed=51)
+    gen = torch.Generator().manual_seed(52)
+    latent = torch.randn(B, 1, T, V_DIM, generator=gen, dtype=torch.float32)
+    latent *= torch.tensor([0.001, 0.01, 0.1, 1.0]).repeat_interleave(128)
+    rope = torch.randn(B, 1, T, K_DIM - V_DIM, generator=gen, dtype=torch.float32).to(torch.bfloat16)
+
+    tt_latent = to_dev(latent.to(torch.bfloat16), device, ttnn.bfloat16)
+    tt_fp8, tt_scales = ttnn.experimental.deepseek_prefill.per_token_cast_to_fp8(
+        tt_latent, round_scale_to_power_of_two=True
+    )
+    tt_reconstructed = ttnn.experimental.deepseek_prefill.per_token_cast_back(
+        tt_fp8, tt_scales, output_dtype=ttnn.bfloat16
+    )
+    reconstructed = torch.cat([ttnn.to_torch(tt_reconstructed).float(), rope.float()], dim=-1)
+
+    tt_packed = ttnn.experimental.deepseek_prefill.pack_scaled_fp8_kv_cache(
+        tt_fp8, tt_scales, to_dev(rope, device, ttnn.bfloat16)
+    )
+    tt_packed = ttnn.to_memory_config(tt_packed, _nd_sharded_dram_config(device, T, 656))
+    tt_q = to_dev(q.to(torch.bfloat16), device, ttnn.bfloat16)
+    tt_idx = to_dev(indices.to(torch.int32), device, ttnn.uint32)
+
+    for cache_batch_idx in range(B):
+        out = ttnn.transformer.sparse_sdpa(
+            tt_q,
+            tt_packed,
+            tt_idx,
+            V_DIM,
+            scale=scale,
+            k_chunk_size=kc,
+            cache_batch_idx=cache_batch_idx,
+        )
+        expected = golden(q, reconstructed[cache_batch_idx : cache_batch_idx + 1], indices, scale, V_DIM)
+        score = pcc(ttnn.to_torch(out), expected)
+        assert score >= 0.99, f"scaled ND-sharded PCC {score:.5f} (slot={cache_batch_idx})"
 
 
 # ---- A SHARDED kv's per-page bank mapping derives from its tensor shape (the accessor's shard strides), which
