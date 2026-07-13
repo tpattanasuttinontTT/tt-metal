@@ -364,19 +364,25 @@ def run_model(
     ttnn.synchronize_device(mesh_device)
     profiler.end("tt_moe_creation")
 
-    profiler.start("tt_forward")
     logger.debug("Running TtMoe forward pass...")
 
-    tt_x = upload_tt_x()
-    signpost(header="tt_forward_START")
-    tt_output, tt_intermediates = tt_moe(
-        tt_x, return_intermediates=run_pcc_check, actual_isl=actual_isl, padding_side="right"
-    )
-    ttnn.synchronize_device(mesh_device)
-    signpost(header="tt_forward_END")
+    # Run twice: the first iteration populates the persistent program cache, so only
+    # the second iteration reflects steady-state forward-pass latency. Both iterations
+    # are profiled into profiler.times["tt_forward"]; downstream we read index [1].
+    tt_output, tt_intermediates = None, None
+    for i in range(2):
+        # TtMoe.forward deallocates its input (tt_moe.py:522), so re-upload each iter.
+        tt_x = upload_tt_x()
+        signpost(header=f"tt_forward_START_iter{i}")
+        profiler.start("tt_forward")
+        tt_output, tt_intermediates = tt_moe(
+            tt_x, return_intermediates=run_pcc_check, actual_isl=actual_isl, padding_side="right"
+        )
+        ttnn.synchronize_device(mesh_device)
+        profiler.end("tt_forward")
+        signpost(header=f"tt_forward_END_iter{i}")
 
-    profiler.end("tt_forward")
-    logger.debug(f"  tt_forward: {profiler.get('tt_forward') * 1000:.2f} ms")
+    logger.debug(f"  tt_forward (second run): {profiler.times['tt_forward'][1] * 1000:.2f} ms")
 
     # Early return when run_pcc_check=False (profiling mode)
     if not run_pcc_check:
