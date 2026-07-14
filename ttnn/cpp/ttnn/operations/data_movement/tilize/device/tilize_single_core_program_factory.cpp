@@ -5,6 +5,7 @@
 #include "tilize_single_core_program_factory.hpp"
 
 #include <tt-metalium/constants.hpp>
+#include <tt-metalium/hal.hpp>
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/program_descriptors.hpp>
@@ -54,6 +55,16 @@ ProgramDescriptor TilizeSingleCoreProgramFactory::create_descriptor(
     uint32_t num_tiles_in_row = stick_s / TILE_WIDTH;
     uint32_t num_tiles_per_block = 1;
 
+    // On Blackhole, UINT8 rows narrower than the 64-byte DRAM read granularity can land on a
+    // misaligned DRAM address, causing the NOC to corrupt adjacent L1 data.  The reader handles
+    // this by staging each row through a temporary c_1 buffer, issuing an aligned over-read, then
+    // using tt_memmove to copy the valid slice into c_0.  Pass dram_alignment as a compile-time
+    // arg (0 for all other combinations) so the staging branch is compiled away on WH.
+    const uint32_t dram_alignment = tt::tt_metal::hal::get_dram_alignment();
+    const bool needs_alignment_staging =
+        a.device()->arch() == tt::ARCH::BLACKHOLE && a.dtype() == DataType::UINT8 && stick_size < dram_alignment;
+    const uint32_t dram_alignment_ct = needs_alignment_staging ? dram_alignment : 0u;
+
     if (!operation_attributes.use_low_perf) {
         // Ensure we don't intrude into storage space
         uint32_t max_l1_size =
@@ -84,6 +95,23 @@ ProgramDescriptor TilizeSingleCoreProgramFactory::create_descriptor(
 
     ProgramDescriptor desc;
 
+    if (needs_alignment_staging) {
+        // c_1: per-row staging buffer for alignment-safe DRAM reads (BH UINT8 narrow sticks).
+        // Sized as (one row width) + 2 * dram_alignment:
+        //   +dram_alignment: tail bytes from rounding the source address down to alignment
+        //   +dram_alignment: headroom for aligning the raw get_write_ptr up to dram_alignment
+        uint32_t temp_cb_size = block_width_size + 2 * dram_alignment;
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = temp_cb_size,
+            .core_ranges = core_ranges,
+            .format_descriptors = {{CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(tt::CBIndex::c_1),
+                .data_format = input_cb_data_format,
+                .page_size = temp_cb_size,
+            }}},
+        });
+    }
+
     desc.cbs.push_back(CBDescriptor{
         .total_size = num_input_tiles * input_single_tile_size,
         .core_ranges = core_ranges,
@@ -104,8 +132,12 @@ ProgramDescriptor TilizeSingleCoreProgramFactory::create_descriptor(
         }}},
     });
 
-    // Reader compile-time args
-    std::vector<uint32_t> reader_compile_time_args = {stick_size};
+    // Reader compile-time args.
+    // Index 0: stick_size (used by TensorAccessorArgs noc-traits for page-size validation).
+    // Index 1: dram_alignment_ct — non-zero only on BH+UINT8 narrow sticks; tells the reader
+    //          to use the c_1 staging buffer for alignment-safe DRAM reads.
+    // Index 2+: TensorAccessorArgs fields.
+    std::vector<uint32_t> reader_compile_time_args = {stick_size, dram_alignment_ct};
     TensorAccessorArgs(*src0_buffer).append_to(reader_compile_time_args);
 
     std::vector<uint32_t> writer_compile_time_args = {output_cb_index};

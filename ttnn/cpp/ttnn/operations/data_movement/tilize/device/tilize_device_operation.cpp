@@ -139,15 +139,6 @@ void TilizeDeviceOperation::validate_on_program_cache_miss(
             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::UINT8 or
             input_tensor_a.dtype() == DataType::FP8_E4M3,
         "data type must be bfloat16, float32, uint32, int32, uint16, uint8, or fp8_e4m3");
-    // On Blackhole the single-core reader lacks the 64-byte DRAM alignment staging that uint8
-    // requires (narrow uint8 rows can misalign the NOC write pointer, corrupting adjacent L1).
-    // use_low_perf forces the single-core factory, so reject it explicitly rather than silently
-    // overriding it with the block factory.
-    TT_FATAL(
-        !(input_tensor_a.device()->arch() == tt::ARCH::BLACKHOLE && input_tensor_a.dtype() == DataType::UINT8 &&
-          !input_tensor_a.memory_config().is_sharded() && operation_attributes.use_low_perf),
-        "tilize: use_low_perf=True is not supported for uint8 on Blackhole — the single-core reader "
-        "lacks 64-byte DRAM alignment staging. Use use_multicore=True (the default) instead.");
     // fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format. Reject non-float outputs:
     // fp8 itself is ROW_MAJOR-only, and integer outputs are meaningless for a float input.
     {
@@ -224,22 +215,28 @@ TilizeDeviceOperation::program_factory_t TilizeDeviceOperation::select_program_f
     const TilizeDeviceOperation::tensor_args_t& tensor_args) {
     const auto& input_tensor_a = tensor_args.input_tensor;
 
-    // On Blackhole, the DRAM read alignment is 64 bytes. UInt8 rows narrower than 64 bytes
-    // (e.g. width=32 → 32-byte page) can produce a misalignment between the L1 write pointer
-    // offset and the DRAM source offset within a 64-byte block, causing the NOC to corrupt
-    // adjacent L1 data. The block factory reader handles this via a staging buffer (c_1) and
-    // an explicit alignment check. Route non-sharded UInt8 inputs on Blackhole through the
-    // block factory to guarantee correct DRAM alignment handling.
-    // use_low_perf=True is rejected in validate_on_program_cache_miss for this combination
-    // (single-core reader lacks alignment staging), so only !use_low_perf reaches here.
-    if (!operation_attributes.use_low_perf && input_tensor_a.device()->arch() == tt::ARCH::BLACKHOLE &&
-        input_tensor_a.dtype() == DataType::UINT8 && !input_tensor_a.memory_config().is_sharded()) {
-        return ttnn::prim::TilizeMultiCoreBlockProgramFactory{};
-    }
-
+    // On Blackhole, UINT8 rows narrower than the 64-byte DRAM read granularity can land on a
+    // misaligned DRAM page, causing the NOC to corrupt adjacent L1 data.
+    //
+    // Both factories handle this correctly:
+    //   • single-core → TilizeSingleCoreProgramFactory: adds a c_1 staging buffer and uses an
+    //     alignment-aware reader when stick_size < dram_alignment.
+    //   • multicore   → TilizeMultiCoreBlockProgramFactory: has always used the alignment-aware
+    //     reader_unary_pad_multicore_both_dims reader with its own c_1 staging.
+    //
+    // Compute the single-core decision up-front so the BH routing only fires when the caller
+    // genuinely wants multicore (none of the three single-core conditions apply).
     bool use_single_core = (operation_attributes.use_low_perf) || (!operation_attributes.use_multicore) ||
                            (operation_attributes.sub_core_grids.has_value() &&
                             (operation_attributes.sub_core_grids.value().num_cores() < 2));
+
+    // Route truly-multicore BH+UINT8 to the block factory so the alignment-aware reader is used.
+    // Single-core requests (use_low_perf, !use_multicore, or 1-core sub_core_grids) fall through
+    // to TilizeSingleCoreProgramFactory which now has its own alignment staging.
+    if (!use_single_core && input_tensor_a.device()->arch() == tt::ARCH::BLACKHOLE &&
+        input_tensor_a.dtype() == DataType::UINT8 && !input_tensor_a.memory_config().is_sharded()) {
+        return ttnn::prim::TilizeMultiCoreBlockProgramFactory{};
+    }
     if (use_single_core) {
         return ttnn::prim::TilizeSingleCoreProgramFactory{};
     }
