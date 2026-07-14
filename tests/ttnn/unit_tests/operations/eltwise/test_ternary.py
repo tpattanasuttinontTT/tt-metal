@@ -432,3 +432,46 @@ def test_ternary_scalar_distinguishes_cache_entries(device):
     )
 
     device.disable_and_clear_program_cache()
+
+
+def test_ternary_addcmul_cache_hit_refreshes_operand_addresses(device):
+    """Regression guard for the ternary buffer-address static/dynamic contract (cache-hit bug).
+
+    Two same-shaped addcmul calls reuse the same cached program (correct), but the cache-hit path
+    must re-patch the runtime args holding the operand/output buffer ADDRESSES. Before the fix, the
+    second same-shaped call whose operand lived in a DIFFERENT buffer ran against the first call's
+    stale addresses and returned silent garbage (PCC ~0). Here the operands are distinct
+    ttnn.chunk() slices of a single parent tensor, so they are the same shape but different buffers.
+    TernaryDeviceOperation::get_dynamic_runtime_args() must refresh reader slots 0/1/2 and writer
+    slot 0 on every dispatch.
+    """
+    device.enable_program_cache()
+    device.clear_program_cache()
+
+    torch.manual_seed(0)
+    N, H = 32, 64
+
+    base_t = torch.rand((1, 1, N, H), dtype=torch.bfloat16)
+    chunks_t = torch.rand((1, 1, 1, 4 * H), dtype=torch.bfloat16)
+
+    base = ttnn.from_torch(base_t, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    chunks = ttnn.from_torch(chunks_t, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    chunk = ttnn.chunk(chunks, 4, -1)  # 4 shape-identical operands in different buffers
+
+    def reference(i):
+        return base_t + base_t * chunks_t[..., i * H : (i + 1) * H]
+
+    # First call compiles the addcmul program.
+    out0 = ttnn.to_torch(ttnn.addcmul(base, base, chunk[0], value=1.0)).float()
+    entries_after_first = device.num_program_cache_entries()
+    assert_with_pcc(reference(0), out0, 0.99)
+
+    # Cache hit with a different-buffer operand of identical shape: the addcmul program must be
+    # reused (no new cache entry), yet the stale-address regression made this return ~0 PCC.
+    out2 = ttnn.to_torch(ttnn.addcmul(base, base, chunk[2], value=1.0)).float()
+    assert (
+        device.num_program_cache_entries() == entries_after_first
+    ), "same-shaped addcmul must reuse the cached program (no new cache entry)"
+    assert_with_pcc(reference(2), out2, 0.99)
+
+    device.disable_and_clear_program_cache()

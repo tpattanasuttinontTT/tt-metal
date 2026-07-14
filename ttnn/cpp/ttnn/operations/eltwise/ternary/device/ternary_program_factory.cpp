@@ -1425,35 +1425,36 @@ std::vector<tt::tt_metal::DynamicRuntimeArg> TernaryDeviceOperation::get_dynamic
     // (the first invocation is correct; later same-shaped ones with a different-buffer operand are
     // wrong -- e.g. two ttnn.chunk slices of the same parent). Mirror the scalar mechanism.
     const auto variant = operation_attributes.ternary_variant;
-    const uint32_t a_addr = tensor_args.input_tensor_a.buffer()->address();
     const uint32_t out_addr = output.buffer()->address();
-    uint32_t r1_addr = 0;  // reader slot 1 (true tensor for TTT/TTS, absent for TST-scalar)
-    uint32_t r2_addr = 0;  // reader slot 2 (false tensor for TTT)
+
+    // Build the (reader slot -> operand address) list ONCE, per variant, so the per-core loop below
+    // carries no variant branch. Reader slot 0 is always input_tensor_a. TTT additionally reads the
+    // true tensor (input_b) at slot 1 and the false tensor (input_c) at slot 2. TTS reads input_b at
+    // slot 1. TST reads its lone tensor operand (input_c) at slot 1.
+    std::vector<std::pair<uint32_t, uint32_t>> reader_slot_addrs;  // (arg_idx, address)
+    reader_slot_addrs.reserve(3);
+    reader_slot_addrs.emplace_back(0, tensor_args.input_tensor_a.buffer()->address());
     if (variant == TernaryVariant::TTT) {
-        r1_addr = tensor_args.input_tensor_b->buffer()->address();
-        r2_addr = tensor_args.input_tensor_c->buffer()->address();
+        reader_slot_addrs.emplace_back(1, tensor_args.input_tensor_b->buffer()->address());
+        reader_slot_addrs.emplace_back(2, tensor_args.input_tensor_c->buffer()->address());
     } else if (variant == TernaryVariant::TTS) {
-        r1_addr = tensor_args.input_tensor_b->buffer()->address();
+        reader_slot_addrs.emplace_back(1, tensor_args.input_tensor_b->buffer()->address());
     } else {  // TST: the tensor operand is input_c, placed at reader slot 1
-        r1_addr = tensor_args.input_tensor_c->buffer()->address();
+        reader_slot_addrs.emplace_back(1, tensor_args.input_tensor_c->buffer()->address());
     }
 
     std::vector<tt::tt_metal::DynamicRuntimeArg> dynamic_args;
-    dynamic_args.reserve(partition.cores.size() * 5);
+    dynamic_args.reserve(partition.cores.size() * 4);
     for (uint32_t i = 0; i < partition.num_cores_total; ++i) {
         const auto& core = partition.cores[i];
         const bool is_work_core = partition.core_group_1.contains(core) || partition.core_group_2.contains(core);
         if (!is_work_core) {
             continue;  // noop core: compute arg[3] stays 0, mirrors create_descriptor()
         }
-        dynamic_args.push_back({kReaderKernelIdx, core, 0, a_addr});
-        if (variant == TernaryVariant::TTT) {
-            dynamic_args.push_back({kReaderKernelIdx, core, 1, r1_addr});
-            dynamic_args.push_back({kReaderKernelIdx, core, 2, r2_addr});
-        } else {
-            dynamic_args.push_back({kReaderKernelIdx, core, 1, r1_addr});
+        for (const auto& [arg_idx, addr] : reader_slot_addrs) {
+            dynamic_args.push_back({kReaderKernelIdx, core, arg_idx, addr});
         }
-        dynamic_args.push_back({kWriterKernelIdx, core, 0, out_addr});
+        dynamic_args.push_back({kWriterKernelIdx, core, 0, out_addr});  // smuggled-rta-ok: re-patched here every hit
         dynamic_args.push_back({kComputeKernelIdx, core, kScalarArgIdx, scalar_arg});
     }
     return dynamic_args;
