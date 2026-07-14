@@ -32,6 +32,7 @@ inline void bitwise_and_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
 inline void bitwise_not_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
 
 inline void bitwise_or_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
+inline void bitwise_xor_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
 
 inline void celu_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
 
@@ -169,6 +170,8 @@ inline void llk_math_eltwise_unary_sfpu_init() {
         sfpu::bitwise_not_init();
     } else if constexpr (sfpu_op == SfpuType::bitwise_or) {
         sfpu::bitwise_or_init();
+    } else if constexpr (sfpu_op == SfpuType::bitwise_xor) {
+        sfpu::bitwise_xor_init();
     } else if constexpr (sfpu_op == SfpuType::celu) {
         sfpu::celu_init();
     } else if constexpr (sfpu_op == SfpuType::clamp) {

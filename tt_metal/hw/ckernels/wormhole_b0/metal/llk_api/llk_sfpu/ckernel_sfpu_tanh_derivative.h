@@ -46,7 +46,6 @@ inline void calculate_tanh_derivative() {
 
 template <bool APPROXIMATION_MODE>
 inline void tanh_derivative_init() {
-    math::reset_counters(p_setrwc::SET_ABD_F);
     l_reg[LRegs::LReg0] = vUInt(static_cast<std::uint16_t>(0x1DFF));  // 0.90625*x
     l_reg[LRegs::LReg1] = vUInt(static_cast<std::uint16_t>(0x481A));  // 0.09375*x + 0.8125
     l_reg[LRegs::LReg2] = vUInt(static_cast<std::uint16_t>(0xFF00));  // 1
