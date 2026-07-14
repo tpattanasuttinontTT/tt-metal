@@ -10,6 +10,7 @@
 #include "sanitizer/api.h"
 #ifdef TRISC_MATH
 #include "llk_math_matmul_api.h"
+#include "llk_math_eltwise_unary_sfpu_init.h"
 #endif
 #ifdef TRISC_UNPACK
 #include "llk_unpack_AB_matmul_api.h"
@@ -289,6 +290,11 @@ mm_init(
     MATH((llk_math_hw_configure<DST_ACCUM_MODE>(in0_cb_id, in1_cb_id)));
     MATH((llk_math_pack_sync_init<DST_ACCUM_MODE>()));
     MATH((llk_math_matmul_init<MATH_FIDELITY, MM_THROTTLE>(in0_cb_id, in1_cb_id, transpose)));
+    // This "full init" runs before any op-specific init, and matmul-based SFPU kernels (e.g. SDPA) use it
+    // instead of compute_kernel_hw_startup. Carry the once-per-kernel SFPU setup (config reg + ADDR_MOD_7) here
+    // too, so their SFPU ops get it. TODO: remove once mm_init is deprecated/removed and such kernels call
+    // compute_kernel_hw_startup (which already runs llk_math_sfpu_init_once()).
+    MATH((llk_math_sfpu_init_once()));
 
     PACK((llk_pack_hw_configure<DST_ACCUM_MODE>(out_cb_id)));
     PACK((llk_pack_dest_init<DST_ACCUM_MODE, PackMode::Default>()));
