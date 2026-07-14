@@ -139,6 +139,15 @@ void TilizeDeviceOperation::validate_on_program_cache_miss(
             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::UINT8 or
             input_tensor_a.dtype() == DataType::FP8_E4M3,
         "data type must be bfloat16, float32, uint32, int32, uint16, uint8, or fp8_e4m3");
+    // On Blackhole the single-core reader lacks the 64-byte DRAM alignment staging that uint8
+    // requires (narrow uint8 rows can misalign the NOC write pointer, corrupting adjacent L1).
+    // use_low_perf forces the single-core factory, so reject it explicitly rather than silently
+    // overriding it with the block factory.
+    TT_FATAL(
+        !(input_tensor_a.device()->arch() == tt::ARCH::BLACKHOLE && input_tensor_a.dtype() == DataType::UINT8 &&
+          !input_tensor_a.memory_config().is_sharded() && operation_attributes.use_low_perf),
+        "tilize: use_low_perf=True is not supported for uint8 on Blackhole — the single-core reader "
+        "lacks 64-byte DRAM alignment staging. Use use_multicore=True (the default) instead.");
     // fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format. Reject non-float outputs:
     // fp8 itself is ROW_MAJOR-only, and integer outputs are meaningless for a float input.
     {
@@ -219,8 +228,10 @@ TilizeDeviceOperation::program_factory_t TilizeDeviceOperation::select_program_f
     // (e.g. width=32 → 32-byte page) can produce a misalignment between the L1 write pointer
     // offset and the DRAM source offset within a 64-byte block, causing the NOC to corrupt
     // adjacent L1 data. The block factory reader handles this via a staging buffer (c_1) and
-    // an explicit alignment check. Route all non-sharded UInt8 inputs on Blackhole through
-    // the block factory to guarantee correct DRAM alignment handling.
+    // an explicit alignment check. Route non-sharded UInt8 inputs on Blackhole through the
+    // block factory to guarantee correct DRAM alignment handling.
+    // use_low_perf=True is rejected in validate_on_program_cache_miss for this combination
+    // (single-core reader lacks alignment staging), so only !use_low_perf reaches here.
     if (!operation_attributes.use_low_perf && input_tensor_a.device()->arch() == tt::ARCH::BLACKHOLE &&
         input_tensor_a.dtype() == DataType::UINT8 && !input_tensor_a.memory_config().is_sharded()) {
         return ttnn::prim::TilizeMultiCoreBlockProgramFactory{};
