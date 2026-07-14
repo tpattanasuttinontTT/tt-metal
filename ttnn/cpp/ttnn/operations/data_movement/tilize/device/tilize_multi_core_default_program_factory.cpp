@@ -27,8 +27,11 @@ ProgramDescriptor TilizeMultiCoreDefaultProgramFactory::create_descriptor(
     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
     tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+    // UInt8 requires fp32 dest acc on Blackhole: hardware promotes 8-bit integers to 32-bit in
+    // dest but keeps them as integers (not float), so the output CB stays as UInt8 (not Float32).
     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
+                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+                        a.dtype() == DataType::UINT8;
 
     Buffer* src0_buffer = a.buffer();
     Buffer* dst_buffer = output.buffer();
@@ -121,7 +124,8 @@ ProgramDescriptor TilizeMultiCoreDefaultProgramFactory::create_descriptor(
     std::vector<uint32_t> compute_args_cliff = {nblocks_per_core_cliff, ntiles_per_block};
 
     std::vector<UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
-    if (fp32_llk_acc) {
+    // UInt8 uses 32-bit dest as integer (not float): do not enable FP32 unpack-to-dest mode.
+    if (fp32_llk_acc && a.dtype() != DataType::UINT8) {
         unpack_to_dest_mode[tt::CBIndex::c_0] = UnpackToDestMode::UnpackToDestFp32;
     }
 

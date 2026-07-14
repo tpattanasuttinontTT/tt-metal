@@ -23,8 +23,11 @@ ProgramDescriptor TilizeMultiCoreShardedProgramFactory::create_descriptor(
     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
     tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+    // UInt8 requires fp32 dest acc on Blackhole: hardware promotes 8-bit integers to 32-bit in
+    // dest but keeps them as integers (not float), so the output CB stays as UInt8 (not Float32).
     bool fp32_llk_acc = input.dtype() == DataType::FLOAT32 || input.dtype() == DataType::FP8_E4M3 ||
-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
+                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+                        input.dtype() == DataType::UINT8;
 
     auto shard_spec = input.shard_spec().value();
     uint32_t num_tiles_per_shard = shard_spec.shape[0] * shard_spec.shape[1] / TILE_HW;
@@ -131,7 +134,8 @@ ProgramDescriptor TilizeMultiCoreShardedProgramFactory::create_descriptor(
     // Compute: standard tilize kernel (same for both output paths).
     {
         std::vector<UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
-        if (fp32_llk_acc) {
+        // UInt8 uses 32-bit dest as integer (not float): do not enable FP32 unpack-to-dest mode.
+        if (fp32_llk_acc && input.dtype() != DataType::UINT8) {
             unpack_to_dest_mode[tt::CBIndex::c_0] = UnpackToDestMode::UnpackToDestFp32;
         }
 
