@@ -16,11 +16,16 @@ from helpers.golden_generators import (
 from helpers.llk_params import (
     BroadcastType,
     DestAccumulation,
+    DestSync,
     MathFidelity,
     MathOperation,
     format_dict,
 )
-from helpers.param_config import input_output_formats, parametrize
+from helpers.param_config import (
+    get_num_blocks_and_num_tiles_in_block,
+    input_output_formats,
+    parametrize,
+)
 from helpers.stimuli_config import StimuliConfig
 from helpers.stimuli_generator import generate_stimuli
 from helpers.test_config import TestConfig
@@ -28,6 +33,8 @@ from helpers.test_variant_parameters import (
     BROADCAST_TYPE,
     MATH_FIDELITY,
     MATH_OP,
+    NUM_BLOCKS,
+    NUM_TILES_IN_BLOCK,
     TILE_COUNT,
     TemplateParameter,
     generate_input_dim,
@@ -64,7 +71,7 @@ class CT_DIM(TemplateParameter):
         MathFidelity.HiFi4,
     ],
     broadcast_type=[BroadcastType.Column],
-    input_dimensions_A=[[32, w] for w in range(32, 257, 32)],
+    input_dimensions_A=[[32, w] for w in range(32, 257, 32)] + [[32, 1024]],
     input_dimensions_B=[[32, 32]],
 )
 def test_eltwise_bcast_col_custom(
@@ -132,6 +139,10 @@ def test_eltwise_bcast_col_custom(
         mathop, src_A, src_B_golden_expanded, formats.output_format, math_fidelity
     )
 
+    num_blocks, num_tiles_in_block = get_num_blocks_and_num_tiles_in_block(
+        DestSync.Half, dest_acc, formats, input_dimensions_A
+    )
+
     configuration = TestConfig(
         cpp_source,
         formats,
@@ -142,7 +153,11 @@ def test_eltwise_bcast_col_custom(
             BROADCAST_TYPE(broadcast_type),
             CT_DIM(ct_dim),
         ],
-        runtimes=[TILE_COUNT(tile_cnt_A)],
+        runtimes=[
+            TILE_COUNT(tile_cnt_A),
+            NUM_BLOCKS(num_blocks),
+            NUM_TILES_IN_BLOCK(num_tiles_in_block),
+        ],
         variant_stimuli=StimuliConfig(
             src_A_tilized,
             formats.input_format,
