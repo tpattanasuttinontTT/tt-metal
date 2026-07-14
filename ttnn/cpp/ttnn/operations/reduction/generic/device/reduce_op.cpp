@@ -203,8 +203,12 @@ Tensor reduce(
         // Multi-core HW reduction: first reduce W, then reduce H on the result.
         // For the Sum chain's terminal fp32->bf16 stage, keep W in fp32 so only H packs to bf16.
         const auto out_final_dtype = output_dtype.value_or(input_tensor.dtype());
-        const bool keep_w_fp32 = output_dtype.has_value() && out_final_dtype == tt::tt_metal::DataType::BFLOAT16 &&
-                                 tilized_input.dtype() == tt::tt_metal::DataType::FLOAT32;
+        // const bool keep_w_fp32 = output_dtype.has_value() && out_final_dtype == tt::tt_metal::DataType::BFLOAT16 &&
+        //                          tilized_input.dtype() == tt::tt_metal::DataType::FLOAT32;
+        const bool keep_w_fp32 =
+            (output_dtype.has_value() && out_final_dtype == tt::tt_metal::DataType::BFLOAT16 &&
+             tilized_input.dtype() == tt::tt_metal::DataType::FLOAT32) ||
+            (tilized_input.dtype() == tt::tt_metal::DataType::BFLOAT16 && config.fp32_dest_acc_en == true);
         const auto out_w_dtype = keep_w_fp32 ? tt::tt_metal::DataType::FLOAT32 : out_final_dtype;
 
         const Tensor output_tensor = ttnn::prim::reduce(
