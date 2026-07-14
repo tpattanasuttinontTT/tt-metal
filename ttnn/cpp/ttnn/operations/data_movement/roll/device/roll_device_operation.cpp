@@ -43,8 +43,18 @@ void RollDeviceOperation::validate_on_program_cache_hit(
 
 ttsl::hash::hash_t RollDeviceOperation::compute_program_hash(
     const operation_attributes_t& attrs, const tensor_args_t& args) {
+    // Hash the padded shape (rank + per-dim extents): the descriptor fast path re-uses the cached
+    // roll plan on a hit, but compute_roll_plan derives rd, transfer routing, offsets and CB sizing
+    // from the actual shape dims. Two same-(shift,dim,mem_config) rolls with different shapes (e.g.
+    // [1,1,8,16] vs [1,2,4,16] on one 4-core [2,16] shard spec) would otherwise collide and re-use a
+    // stale plan, silently rolling the wrong rows.
     return tt::tt_metal::operation::hash_operation<RollDeviceOperation>(
-        attrs.shift, attrs.dim, args.input.memory_config(), args.input.dtype(), args.input.layout());
+        attrs.shift,
+        attrs.dim,
+        args.input.memory_config(),
+        args.input.dtype(),
+        args.input.layout(),
+        args.input.padded_shape());
 }
 
 RollDeviceOperation::spec_return_value_t RollDeviceOperation::compute_output_specs(

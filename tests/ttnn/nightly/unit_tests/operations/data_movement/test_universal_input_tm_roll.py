@@ -354,6 +354,115 @@ def test_roll_program_cache_distinct_shifts(device, shift):
     run_roll(device, torch.randn(shape, dtype=torch.bfloat16), ttnn.ROW_MAJOR_LAYOUT, mem_config, [shift], [3])
 
 
+# ─── Program-cache hash: shape must be part of the key (regression for the fast path) ──
+
+
+def test_roll_program_cache_distinct_shapes_same_shard_spec(device):
+    """Two rolls that share (shift, dim, mem_config, dtype, layout) but differ only in
+    padded shape must NOT collide in the program cache.
+
+    [1,1,8,16] and [1,2,4,16] both map to the same 4-core [2,16] HEIGHT_SHARDED shard
+    spec and the same (shift=4, dim=3), yet compute_roll_plan derives different row
+    routing / offsets from their shapes. Before the shape was folded into
+    RollDeviceOperation::compute_program_hash they produced an identical key, so the
+    second call took the descriptor fast path and re-used the first call's stale plan.
+    This asserts they now create distinct cache entries and both results are correct.
+    """
+    torch.manual_seed(15)
+    shard_spec = ttnn.ShardSpec(
+        ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))}),
+        [2, 16],
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    mem_config = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
+
+    entries_before = device.num_program_cache_entries()
+    run_roll(device, torch.randn([1, 1, 8, 16], dtype=torch.bfloat16), ttnn.ROW_MAJOR_LAYOUT, mem_config, [4], [3])
+    entries_after_first = device.num_program_cache_entries()
+    run_roll(device, torch.randn([1, 2, 4, 16], dtype=torch.bfloat16), ttnn.ROW_MAJOR_LAYOUT, mem_config, [4], [3])
+    entries_after_second = device.num_program_cache_entries()
+
+    assert entries_after_first > entries_before, "first shape must be a cache miss"
+    assert entries_after_second > entries_after_first, "differently shaped roll must not collide with the cached plan"
+
+
+# ─── Program-cache: cache-hit retargeting on freshly allocated buffers ────────
+
+
+def _roll_fresh(device, shape, mem_config, shifts, dims, bias):
+    """Allocate a brand-new input/output for a roll and validate the result.
+
+    Returns (torch_input, ttnn_input, ttnn_output); callers hold the references alive so
+    that a subsequent allocation lands at a different address, forcing the cache-hit path
+    to retarget its per-bank base+offset runtime args / CB bindings.
+    """
+    torch_input = torch.randn(shape, dtype=torch.bfloat16) + bias
+    ttnn_input = ttnn.from_torch(
+        torch_input, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device, memory_config=mem_config
+    )
+    ttnn_output = ttnn.roll(ttnn_input, list(shifts), list(dims))
+    got = ttnn.to_torch(ttnn_output.cpu())
+    ref = torch.roll(torch_input, list(shifts), list(dims))
+    assert_with_pcc(ref.float(), got.float(), _PCC)
+    return torch_input, ttnn_input, ttnn_output
+
+
+def test_roll_l1_sharded_cache_hit_retargets_buffers(device):
+    """L1 HEIGHT_SHARDED roll: a second identical-spec roll on freshly allocated buffers
+    must reuse the cached program yet still be correct.
+
+    Guards the descriptor fast path: L1 mode re-emits a hash-stable placeholder to trip
+    the fast path so the CB .buffer addresses get re-patched. A stale CB binding from the
+    first dispatch would corrupt the second result even though the program is reused.
+    """
+    torch.manual_seed(16)
+    shard_spec = ttnn.ShardSpec(
+        ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))}),
+        [2, 16],
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    mem_config = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
+
+    _, in1, out1 = _roll_fresh(device, [1, 1, 8, 16], mem_config, [4], [3], 0.0)
+    entries_after_first = device.num_program_cache_entries()
+    _, in2, out2 = _roll_fresh(device, [1, 1, 8, 16], mem_config, [4], [3], 100.0)
+    entries_after_second = device.num_program_cache_entries()
+
+    assert entries_after_second == entries_after_first, "identical-spec sharded roll must be a cache hit"
+    assert in2.buffer_address() != in1.buffer_address(), "second input must occupy a fresh address"
+
+
+def test_roll_dram_sharded_cache_hit_retargets_buffers(device):
+    """DRAM HEIGHT_SHARDED roll: a second identical-spec roll on freshly allocated buffers
+    must reuse the cached program yet still be correct.
+
+    Guards the descriptor fast path for the DRAM mode that bakes per-bank base+shard_offset
+    NOC addresses: those slots are re-emitted on the cache hit. A stale per-bank address
+    from the first dispatch would read/write the wrong DRAM bank on reuse.
+    """
+    torch.manual_seed(17)
+    shape = [1, 1, 8, 16]
+    sh, sw = 2, 16
+    compute_grid = device.compute_with_storage_grid_size()
+    ncores = (shape[0] * shape[1] * shape[2]) // sh
+    if ncores > compute_grid.x * compute_grid.y:
+        pytest.skip(f"Device has insufficient cores ({ncores} needed)")
+    shard_spec = ttnn.ShardSpec(
+        ttnn.num_cores_to_corerangeset(ncores, compute_grid, True),
+        [sh, sw],
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    mem_config = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.DRAM, shard_spec)
+
+    _, in1, out1 = _roll_fresh(device, shape, mem_config, [4], [3], 0.0)
+    entries_after_first = device.num_program_cache_entries()
+    _, in2, out2 = _roll_fresh(device, shape, mem_config, [4], [3], 100.0)
+    entries_after_second = device.num_program_cache_entries()
+
+    assert entries_after_second == entries_after_first, "identical-spec DRAM-sharded roll must be a cache hit"
+    assert in2.buffer_address() != in1.buffer_address(), "second input must occupy a fresh address"
+
+
 # ─── Optional output memory_config ──────────────────────────────────────────
 
 

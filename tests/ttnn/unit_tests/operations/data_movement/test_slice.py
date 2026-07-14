@@ -1582,6 +1582,46 @@ def test_issue_47602_same_shape_reuses_cache_entry(device):
     assert entries_after_second == entries_after_first, "identical slice must be a cache hit, not a miss"
 
 
+def test_slice_rm_interleaved_cache_hit_retargets_buffers(device):
+    """Interleaved ROW_MAJOR slice (SliceRmProgramFactory): two identical-spec slices
+    on freshly allocated input/output buffers must reuse the cached program yet still
+    produce the correct second result.
+
+    Guards the descriptor fast path: the reader's derived base+offset address and the
+    writer's output Buffer* binding are re-emitted on a cache hit. A stale address left
+    over from the first dispatch would corrupt the second result even though the program
+    is reused, which a same-buffer or miss-only test cannot catch.
+    """
+    torch.manual_seed(399)
+    slice_start = [0, 0, 0, 0]
+    slice_end = [1, 4, 64, 64]
+
+    def _slice_fresh(bias):
+        # Distinct data per input so a stale reader address (pointing at the previous
+        # input) would surface as a PCC failure on the second result.
+        t = torch.rand(1, 4, 128, 128, dtype=torch.bfloat16) + bias
+        tt = ttnn.from_torch(
+            t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        out = ttnn.slice(tt, slice_start, slice_end, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        return t, tt, out
+
+    # First call primes the cache.
+    t1, tt1, out1 = _slice_fresh(0.0)
+    entries_after_first = device.num_program_cache_entries()
+
+    # Second call on newly allocated buffers. tt1/out1 are kept alive so tt2/out2 must
+    # land at different addresses, forcing the cache-hit path to retarget both slices.
+    t2, tt2, out2 = _slice_fresh(100.0)
+    entries_after_second = device.num_program_cache_entries()
+
+    assert entries_after_second == entries_after_first, "identical-spec slice must be a cache hit, not a miss"
+    assert tt2.buffer_address() != tt1.buffer_address(), "second input must occupy a fresh address"
+    assert out2.buffer_address() != out1.buffer_address(), "second output must occupy a fresh address"
+    assert_with_pcc(t1[:, :, :64, :64], ttnn.to_torch(out1), 0.9999)
+    assert_with_pcc(t2[:, :, :64, :64], ttnn.to_torch(out2), 0.9999)
+
+
 @pytest.mark.parametrize(
     "shape, slice_start, slice_end",
     [
