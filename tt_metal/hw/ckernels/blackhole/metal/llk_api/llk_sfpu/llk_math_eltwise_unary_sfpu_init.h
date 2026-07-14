@@ -264,6 +264,11 @@ inline void llk_math_eltwise_unary_sfpu_init() {
         sfpu::unused_init();
     } else if constexpr (sfpu_op == SfpuType::typecast) {
         sfpu::typecast_init();
+    } else if constexpr (sfpu_op == SfpuType::exponential) {
+        // SDPA and other direct LLK callers use this no-arg overload to get the generic unary SFPU
+        // addrmod state (config reg + ADDR_MOD_7 + counter reset) without an op-specific init or a
+        // preceding compute_kernel_hw_startup, so route it to the full generic init.
+        _llk_math_eltwise_unary_sfpu_init_<SfpuType::exponential>();
     } else {
         static_assert(
             _sfpu_bare_op_unhandled_<sfpu_op>,
