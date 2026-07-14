@@ -33,6 +33,7 @@ file(
     permute/device/kernels/*
     reshape_on_device/device/kernels/*
     repeat/device/kernels/*
+    repeat/codegen/kernels/*
     roll/device/kernels/*
     reshape_view/device/device/*
     scatter/device/kernels/*
