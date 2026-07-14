@@ -12,6 +12,7 @@
 #include "ckernel_ops.h"
 // clang-format off: sfpi_inline must be defined before ckernel_sfpu_polyval.h
 #include "sfpi.h"
+#include "llk_math_eltwise_unary_sfpu.h"
 #include "sfpu/ckernel_sfpu_polyval.h"
 // clang-format on
 #include "ckernel_sfpu_recip.h"
@@ -725,6 +726,7 @@ template <
     bool CLAMP_NEGATIVE = true,
     bool is_fp32_dest_acc_en = false>
 void exp_init() {
+    math::reset_counters(p_setrwc::SET_ABD_F);
     if constexpr (APPROXIMATION_MODE && CLAMP_NEGATIVE) {
         // Algorithm is adapted from:
         //      A Fast, Compact Approximation of the Exponential Function
