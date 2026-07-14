@@ -111,6 +111,18 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         const uint32_t per_core_M_short = (M_tiles_full + GRID_Y - 1) / GRID_Y;
         chunk_M_tiles = per_core_M_short * GRID_Y;  // single chunk (>= M_tiles_full)
     }
+    // The gate/up K loop requires its block width to divide K_gate_tiles. The
+    // usual width (16) is valid for DeepSeek-V3 and MiniMax-M2.7, but not for
+    // GPT-OSS (emb=2880 -> K_gate_tiles=90). The short-sequence and L1-fit
+    // pickers below already restrict their candidates to divisors; do the same
+    // for the general path before the L1 check, which otherwise leaves 16
+    // unchanged when the requested CB footprint happens to fit.
+    for (uint32_t w = std::min<uint32_t>(in0_block_w_gu, K_gate_tiles); w >= 1; --w) {
+        if (K_gate_tiles % w == 0) {
+            in0_block_w_gu = w;
+            break;
+        }
+    }
     const auto grid_size = t.x.device()->compute_with_storage_grid_size();
     TT_FATAL(
         grid_size.x >= kMaxGridX && grid_size.y >= MAX_GRID_Y,
@@ -321,7 +333,8 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     const uint64_t l1_budget = static_cast<uint64_t>(l1_device->l1_size_per_core()) - l1_reserved - L1_SCRATCH_MARGIN;
 
     // If the requested config — (per_core_M_max, in0_block_w_gu) from
-    // op.chunk_M_tiles and either the short_seq picker or the default 16 —
+    // op.chunk_M_tiles and either the short_seq picker or the largest legal
+    // divisor at or below the default width 16 —
     // overflows the real L1 budget, shrink to fit: reduce per_core_M first (the
     // kernel just runs more chunks; keeping per_core_M large minimises full
     // weight re-reads, the dominant DRAM cost), then narrow in0_block_w_gu to
@@ -369,9 +382,9 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         chunk_M_tiles = per_core_M * GRID_Y;
     }
 
-    // in0_block_w_gu must divide K_gate_tiles (the gate/up K-loop bound); holds
-    // for every value the guard above picks and for the default 16 on all
-    // shipped models (emb a multiple of 512 => K_gate_tiles a multiple of 16).
+    // in0_block_w_gu must divide K_gate_tiles (the gate/up K-loop bound). The
+    // general-path picker above, short-sequence picker, and L1-fit guard all
+    // choose a divisor.
     TT_FATAL(
         K_gate_tiles % in0_block_w_gu == 0,
         "K_gate_tiles ({}) must be divisible by in0_block_w_gu ({})",

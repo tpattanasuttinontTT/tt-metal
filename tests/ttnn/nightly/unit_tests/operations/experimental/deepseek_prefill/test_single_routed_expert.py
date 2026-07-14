@@ -167,25 +167,18 @@ SINGLE_EXPERT_MODELS = [
 
 # Currently-failing single-routed-expert cases, keyed by the exact "{model}-{tag}" param id ->
 # xfail reason (with tracking issue), so CI stays green while the linked issues are worked on. The
-# failures are blackhole-specific (gptoss_120b hits a K_gate divisibility error at 25k; dsv4_pro
-# overflows L1) and these cases pass on other arches, so _TOKEN_SWEEP_XFAIL is applied (strict) only
-# on blackhole by _xfail_blackhole_token_sweep. Delete an entry once resolved.
-_GPTOSS_KGATE_XFAIL = (
-    "GPT-OSS 120B single routed expert: K_gate_tiles not divisible by in0_block_w_gu — "
-    "https://github.com/tenstorrent/tt-metal/issues/47622"
-)
+# failures are blackhole-specific and pass on other arches, so _TOKEN_SWEEP_XFAIL is applied
+# (strict) only on blackhole by _xfail_blackhole_token_sweep. Delete an entry once resolved.
 _DSV4_PRO_CB_XFAIL = (
     "DeepSeek V4 Pro single routed expert: circular buffers grow beyond L1 — "
     "https://github.com/tenstorrent/tt-metal/issues/46486"
 )
 
 _TOKEN_SWEEP_XFAIL = {
-    "gptoss_120b-25k": _GPTOSS_KGATE_XFAIL,
     "dsv4_pro-1k": _DSV4_PRO_CB_XFAIL,
     "dsv4_pro-25k": _DSV4_PRO_CB_XFAIL,
 }
 _FAKED_XFAIL = {
-    "gptoss_120b-25k-alloc-4k-active": _GPTOSS_KGATE_XFAIL,
     "dsv4_pro-1k-alloc-0k-active": _DSV4_PRO_CB_XFAIL,
     "dsv4_pro-25k-alloc-4k-active": _DSV4_PRO_CB_XFAIL,
 }
@@ -359,4 +352,26 @@ def test_single_routed_expert_faked_token_count_models(
 ):
     run_single_routed_expert_faked_token_count(
         mesh_device, device_params, allocated_tokens, active_tokens, emb_dim, hidden_dim
+    )
+
+
+@pytest.mark.extended_model
+@pytest.mark.skipif(not is_blackhole(), reason="device-side count-aware sparsity is Blackhole-only")
+@pytest.mark.parametrize(
+    "mesh_device, device_params", SINGLE_CHIP_MESH_PARAMS, indirect=["mesh_device", "device_params"]
+)
+def test_gptoss_general_path_k_block_width(mesh_device, device_params):
+    """GPT-OSS emb=2880 takes the general (allocated M > 1024) program path.
+
+    Keep only one active tile so this guards program configuration, including
+    K_gate_tiles=90 block-width selection, without turning the regression test
+    into a full long-context performance run.
+    """
+    run_single_routed_expert_faked_token_count(
+        mesh_device,
+        device_params,
+        allocated_tokens=1056,
+        active_tokens=32,
+        emb_dim=GptOss120BConfig.EMB_SIZE,
+        hidden_dim=GptOss120BConfig.MOE_INTERMEDIATE_SIZE,
     )
