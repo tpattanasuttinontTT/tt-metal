@@ -121,7 +121,9 @@ inline void calculate_reciprocal() {
 
 template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool legacy_compat = false>
 void recip_init() {
-    math::reset_counters(p_setrwc::SET_ABD_F);
+    // Full common SFPU init (config reg + ADDR_MOD_7 [+ BH ADDR_MOD_6] + reset). SDPA runs reciprocal in
+    // its softmax after matmul/exp, so the general SFPU state must be re-established here, not just reset.
+    _llk_math_eltwise_unary_sfpu_init_<SfpuType::reciprocal>();
     if constexpr (!legacy_compat) {
         sfpu_reciprocal_init<APPROXIMATION_MODE>();
     }
