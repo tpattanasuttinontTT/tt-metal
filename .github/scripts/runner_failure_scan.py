@@ -701,72 +701,6 @@ def strip_terminal_sequences(value: str) -> str:
     return CSI_SEQUENCE_RE.sub("", OSC_SEQUENCE_RE.sub("", value))
 
 
-def visible_len(value: str) -> int:
-    return len(strip_terminal_sequences(value))
-
-
-def clean_cell(value: Any) -> str:
-    if value is None:
-        return ""
-    return " ".join(str(value).split())
-
-
-def pad_cell(value: str, width: int) -> str:
-    return value + (" " * max(width - visible_len(value), 0))
-
-
-def truncate(value: str, max_width: int) -> str:
-    if visible_len(value) <= max_width:
-        return value
-
-    plain_value = strip_terminal_sequences(value)
-    if max_width <= 3:
-        return plain_value[:max_width]
-    return f"{plain_value[: max_width - 3]}..."
-
-
-def render_table(
-    rows: list[dict[str, Any]], columns: list[tuple[str, str, int]]
-) -> str:
-    if not rows:
-        return "(no rows)"
-
-    rendered_rows = [
-        [truncate(clean_cell(row.get(key)), max_width) for key, _, max_width in columns]
-        for row in rows
-    ]
-    header_lines_by_column = [label.splitlines() or [""] for _, label, _ in columns]
-    header_height = max(len(lines) for lines in header_lines_by_column)
-    widths = [
-        max(
-            *(visible_len(line) for line in header_lines_by_column[index]),
-            *(visible_len(row[index]) for row in rendered_rows),
-        )
-        for index in range(len(columns))
-    ]
-
-    header_rows = []
-    for line_index in range(header_height):
-        header_rows.append(
-            " | ".join(
-                pad_cell(
-                    header_lines_by_column[column_index][line_index]
-                    if line_index < len(header_lines_by_column[column_index])
-                    else "",
-                    widths[column_index],
-                )
-                for column_index in range(len(columns))
-            )
-        )
-    separator_line = "-+-".join("-" * width for width in widths)
-    body_lines = [
-        " | ".join(pad_cell(row[index], widths[index]) for index in range(len(row)))
-        for row in rendered_rows
-    ]
-
-    return "\n".join([*header_rows, separator_line, *body_lines])
-
-
 def signature_found(log_text: str, signature: ErrorSignature) -> bool:
     if signature.pattern:
         flags = 0 if signature.case_sensitive else re.IGNORECASE
@@ -1313,11 +1247,6 @@ def truncate_for_slack(value: str, max_length: int = MAX_SLACK_TEXT_LENGTH) -> s
     return value[: max_length - len(suffix)] + suffix
 
 
-def slack_code_block(value: str) -> str:
-    cleaned_value = value.replace("```", "'''")
-    return f"```{truncate_for_slack(cleaned_value)}```"
-
-
 def post_slack_message(
     slack_config: SlackConfig, text: str, *, thread_ts: str | None = None
 ) -> str:
@@ -1378,68 +1307,50 @@ def format_triggering_jobs_for_slack(
     return truncate_for_slack("\n".join(lines))
 
 
-def signature_cell(result: JobScanResult, label: str) -> str:
+def compact_signature_cell(result: JobScanResult, label: str) -> str:
     if not result.log_checked:
         return ""
-    return "YES" if label in result.signature_labels else "NO"
+    return "Y" if label in result.signature_labels else "N"
 
 
-def runner_log_table_rows(results: list[JobScanResult]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for result in results:
-        job = result.job
-        rows.append(
-            {
-                "GITHUB_RUN_ID": job.run_id,
-                "GITHUB_JOB_ID": job.job_id,
-                "GITHUB_JOB_LINK_DISPLAY": "open" if job.html_url else "",
-                "WORKFLOW": job.workflow,
-                "JOB_NAME": job.name,
-                "JOB_STATUS": job.conclusion or job.status,
-                "JOB_START_TS": job.started_at,
-                "LOG_CHECKED": "YES" if result.log_checked else "NO",
-                "TLB_ERROR_FOUND": signature_cell(result, "TLB error"),
-                "MISSING_DEVICES_FOUND": signature_cell(result, "Missing devices"),
-                "FABRIC_LINK_DOWN_MGD_TOPOLOGY_FOUND": signature_cell(
-                    result, "Fabric link down (MGD topology)"
-                ),
-                "FABRIC_MISSING_LINKS": result.fabric_missing_links,
-                "OUT_OF_DISK_FOUND": signature_cell(result, "Out of disk"),
-            }
-        )
-    return rows
+def format_signature_flags_for_slack(result: JobScanResult) -> str:
+    parts = [
+        f"log:`{'Y' if result.log_checked else 'N'}`",
+        f"tlb:`{compact_signature_cell(result, 'TLB error') or '-'}`",
+        f"missing-dev:`{compact_signature_cell(result, 'Missing devices') or '-'}`",
+        (
+            "fabric:"
+            f"`{compact_signature_cell(result, 'Fabric link down (MGD topology)') or '-'}`"
+        ),
+        f"disk:`{compact_signature_cell(result, 'Out of disk') or '-'}`",
+    ]
+    if result.fabric_missing_links:
+        parts.append(f"links:`{slack_escape(result.fabric_missing_links)}`")
+    return " ".join(parts)
 
 
 def format_runner_log_table_for_slack(
     runner: str, results: list[JobScanResult]
 ) -> str:
-    table = render_table(
-        runner_log_table_rows(results),
-        [
-            ("GITHUB_RUN_ID", "GH run", 13),
-            ("GITHUB_JOB_ID", "GH job", 13),
-            ("GITHUB_JOB_LINK_DISPLAY", "GH link", 7),
-            ("WORKFLOW", "Workflow", 24),
-            ("JOB_NAME", "Job name", 48),
-            ("JOB_STATUS", "Status", 16),
-            ("JOB_START_TS", "Started", 20),
-            ("LOG_CHECKED", "Log checked", 11),
-            ("TLB_ERROR_FOUND", "TLB error", 9),
-            ("MISSING_DEVICES_FOUND", "Missing devices", 15),
-            (
-                "FABRIC_LINK_DOWN_MGD_TOPOLOGY_FOUND",
-                "Fabric link\ndown (MGD\ntopology)",
-                11,
-            ),
-            ("FABRIC_MISSING_LINKS", "Missing links", 44),
-            ("OUT_OF_DISK_FOUND", "Out of disk", 11),
-        ],
-    )
-    return (
-        f"Full log signature table for `{slack_escape(runner)}` "
-        "(`check-logs all` style, all recent repo jobs):\n"
-        f"{slack_code_block(table)}"
-    )
+    lines = [
+        f"Full log signature report for `{slack_escape(runner)}` "
+        "(`check-logs all` style, all recent repo jobs).",
+        "Flags use `Y`/`N`; `-` means the log was not checked.",
+    ]
+    for result in results:
+        job = result.job
+        status = job.conclusion or job.status or "unknown"
+        started_at = job.started_at or "unknown start"
+        job_label = job.job_id or "unknown-job"
+        lines.append(
+            "* "
+            f"{slack_link(job.html_url, job_label)} "
+            f"`{slack_escape(status)}` "
+            f"`{slack_escape(started_at)}` "
+            f"{format_signature_flags_for_slack(result)} "
+            f"{slack_escape(job.workflow)} / {slack_escape(job.name)}"
+        )
+    return truncate_for_slack("\n".join(lines))
 
 
 def post_slack_alerts(
