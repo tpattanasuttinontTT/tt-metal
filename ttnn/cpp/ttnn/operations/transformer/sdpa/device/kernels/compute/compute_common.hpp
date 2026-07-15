@@ -14,6 +14,7 @@
 #include "api/compute/binary_max_min.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_unary/exp.h"
+#include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/eltwise_unary/recip.h"
 #include "api/compute/eltwise_unary/softplus.h"
 #include "api/compute/eltwise_unary/negative.h"
@@ -298,6 +299,7 @@ void sub_exp_block_bcast_cols_inplace(uint32_t in1_cb, uint32_t reduce_cb, uint3
     // The exponential function uses InputClamping::None for better performance. This version
     // produces incorrect outputs for inputs <~ -88, but those outputs are guaranteed to be negative.
     // Enable packer ReLU to zero any negative values produced by the exponential approximation.
+    reinit_sfpu();  // matmul between startup and exp leaves general SFPU state stale; re-establish it
     exp_tile_init<true /* approx */, scale_fp32, InputClamping::None>();
     PACK((llk_pack_relu_config(ReluConfig::zero())));
 
@@ -651,6 +653,7 @@ void sub_exp_block(uint32_t in0_cb, uint32_t in1_cb, uint32_t out_cb, uint32_t n
     // Postcondition: in0_cb and in1_cb has num_tiles produced
 
     sub_tiles_init(in0_cb, in1_cb);
+    reinit_sfpu();  // matmul between startup and exp leaves general SFPU state stale; re-establish it
     exp_tile_init<EXP_APPROX_MODE>();
     cb_in0.wait_front(num_tiles);
     cb_in1.wait_front(num_tiles);
@@ -721,6 +724,7 @@ void correction_block(
     for (uint32_t i = 0; i < num_head_tiles; i++) {
         tile_regs_acquire();
         copy_tile_to_dst_init_short(cb_worker_max);
+        reinit_sfpu();  // matmul between startup and exp leaves general SFPU state stale; re-establish it
         exp_tile_init<EXP_APPROX_MODE>();
         copy_tile(cb_prev_max, i, dst_reg_0);
         copy_tile(cb_worker_max, i, dst_reg_1);
@@ -833,6 +837,7 @@ void sigmoid_sub(uint32_t in0_cb, uint32_t in1_cb, uint32_t out_cb, uint32_t num
     cb_in1.wait_front(num_tiles);
     cb_out.reserve_back(num_tiles);
     sub_tiles_init(in0_cb, in1_cb);
+    reinit_sfpu();  // matmul between startup and exp leaves general SFPU state stale; re-establish it
     exp_tile_init<false>();
     // recip_tile_first_column<false>() calls the scalar sfpu_reciprocal_iter path, so initialize exactly
     // that SFPU state here. Blackhole needs vConstFloatPrgm0 = 2.0 for Newton-Raphson; Wormhole

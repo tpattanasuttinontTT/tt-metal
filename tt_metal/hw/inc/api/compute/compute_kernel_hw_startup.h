@@ -123,6 +123,22 @@ ALWI void compute_kernel_hw_startup(uint32_t icb0, uint32_t ocb) { compute_kerne
 
 // clang-format off
 /**
+ * Re-establishes the general, op-independent SFPU hardware state (SFPU config register + ADDR_MOD_7) that
+ * compute_kernel_hw_startup() programs once at kernel start. Call this in a kernel that runs other engines
+ * (e.g. matmul) between startup and an SFPU op: those can leave the shared SFPU state stale, and the per-op
+ * *_tile_init programs only op-specific setup, not this general state. No-op on Quasar.
+ *
+ * Return value: None
+ */
+// clang-format on
+ALWI void reinit_sfpu() {
+#ifndef ARCH_QUASAR
+    MATH((llk_math_sfpu_init_once()));
+#endif
+}
+
+// clang-format off
+/**
  * Enables FP32 accumulation in the destination register.
  *
  * Configures both the math pipeline (ALU_ACC_CTRL Fp32_enabled and
