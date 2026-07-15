@@ -9,8 +9,8 @@
 //   1. cb_in -> cb_tile: tilize (ROW_MAJOR input) or copy (INPUT_TILE_LAYOUT: input already tiled).
 //   2. compute per-row amax over the 128-element block, clamp(>=1e-4), multiply by 1/448
 //      -> scale (col 0) -> cb_scale_tiles. recip(scale) -> 1/scale -> cb_inv_scale_tiles.
-//   3. divide: out_tile = cb_tile * bcast_col(cb_inv_scale_tiles) per tile -> cb_out_tile.
-//   4. untilize cb_out_tile -> cb_output_e4m3 (scaled, cast to e4m3).
+//   3+4. divide (cb_tile * bcast_col(cb_inv_scale_tiles)) into DST, then pack_untilize_dest straight
+//      to cb_output_e4m3 (scaled, cast to e4m3) -- no cb_out_tile round-trip, no separate untilize.
 // The writer extracts column 0 of cb_scale_tiles into the scale output [..., M, H/128].
 //
 // fp32_dest_acc_en=True (required for e4m3 on Blackhole; also gives fp32 reduce/divide precision).
@@ -30,6 +30,7 @@
 #include "api/compute/eltwise_unary/recip.h"
 #include "api/compute/eltwise_unary/clamp.h"
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
+#include "api/compute/pack_untilize.h"
 #include "api/dataflow/circular_buffer.h"
 
 void kernel_main() {
@@ -168,37 +169,33 @@ void kernel_main() {
                 cb_abs.pop_front(block_wt);
             }
 
-            // ----- 3. divide: cb_out_tile = cb_tile * bcast_col(1/scale) -----
+            // ----- 3+4 fused: divide (cb_tile * bcast_col(1/scale)) into DST, then pack_untilize
+            // straight to e4m3 -- no cb_out_tile L1 round-trip and no separate untilize math pass.
+            // In 32-bit DST (fp32_dest_acc) the half-sync pack-untilize cap is 4 tiles = one block. -----
             reconfig_data_format(cb_tile_id, cb_inv_scale_tiles_id);
-            pack_reconfig_data_format(cb_out_tile_id);
             mul_bcast_cols_init_short(cb_tile_id, cb_inv_scale_tiles_id);
+            pack_untilize_dest_init<tiles_per_block, tiles_per_block>(cb_output_e4m3_id);
             cb_inv_scale_tiles.wait_front(block_ht);
-            cb_out_tile.reserve_back(tiles_per_block);
+            cb_output_e4m3.reserve_back(tiles_per_block);
+            tile_regs_acquire();
             for (uint32_t block_h_idx = 0; block_h_idx < block_ht; ++block_h_idx) {
                 for (uint32_t k = 0; k < block_wt; ++k) {
-                    tile_regs_acquire();
                     mul_tiles_bcast_cols(
-                        cb_tile_id, cb_inv_scale_tiles_id, block_h_idx * block_wt + k, block_h_idx, IDST0);
-                    tile_regs_commit();
-                    tile_regs_wait();
-                    pack_tile(IDST0, cb_out_tile_id);
-                    tile_regs_release();
+                        cb_tile_id,
+                        cb_inv_scale_tiles_id,
+                        block_h_idx * block_wt + k,
+                        block_h_idx,
+                        block_h_idx * block_wt + k);
                 }
             }
-            cb_out_tile.push_back(tiles_per_block);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_untilize_dest<tiles_per_block>(cb_output_e4m3_id);
+            tile_regs_release();
+            cb_output_e4m3.push_back(tiles_per_block);
             cb_tile.pop_front(tiles_per_block);
             cb_inv_scale_tiles.pop_front(block_ht);
-
-            // ----- 4. untilize cb_out_tile -> output e4m3 (scaled) -----
-            reconfig_data_format_srca(cb_out_tile_id);
-            pack_reconfig_data_format(cb_output_e4m3_id);
-            untilize_init(cb_out_tile_id);
-            cb_out_tile.wait_front(tiles_per_block);
-            cb_output_e4m3.reserve_back(tiles_per_block);
-            untilize_block(cb_out_tile_id, tiles_per_block, cb_output_e4m3_id);
-            cb_output_e4m3.push_back(tiles_per_block);
-            cb_out_tile.pop_front(tiles_per_block);
-            untilize_uninit(cb_out_tile_id);
+            pack_untilize_uninit(cb_output_e4m3_id);
         }
     }
 }
