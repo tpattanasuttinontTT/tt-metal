@@ -133,10 +133,12 @@ PerTokenCastBackProgramFactory::cached_program_t PerTokenCastBackProgramFactory:
             .set_page_size(cb_input_e4m3_idx, input_e4m3_tile_bytes);
     CreateCircularBuffer(program, all_cores, cb_input_e4m3_cfg);
 
-    make_compute_tile_cb(cb_in_rm_idx, tiles_per_block);     // input_e4m3 -> compute_df RM
-    make_compute_tile_cb(cb_in_tile_idx, tiles_per_block);   // tilized input (compute_df)
-    make_compute_tile_cb(cb_scale_bcast_idx, 2 * block_ht);  // col0 = scale, compute_df (matches SrcA)
-    make_compute_tile_cb(cb_out_tile_idx, tiles_per_block);  // multiplied tiles -> untilize
+    // Double-buffered so the reader/compute/writer (and the compute UNPACK/MATH/PACK sub-threads) can
+    // run one block ahead of each other without stalling.
+    make_compute_tile_cb(cb_in_rm_idx, 2 * tiles_per_block);     // input_e4m3 -> compute_df RM
+    make_compute_tile_cb(cb_in_tile_idx, 2 * tiles_per_block);   // tilized input (compute_df)
+    make_compute_tile_cb(cb_scale_bcast_idx, 2 * block_ht);      // col0 = scale, compute_df (matches SrcA)
+    make_compute_tile_cb(cb_out_tile_idx, 2 * tiles_per_block);  // multiplied tiles -> untilize
 
     // cb_out: row-major output (bf16/fp32), one tile per page; tiles_per_block pages = one block,
     // double-buffered.

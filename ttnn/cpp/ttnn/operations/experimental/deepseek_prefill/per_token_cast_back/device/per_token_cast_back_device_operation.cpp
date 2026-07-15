@@ -153,6 +153,8 @@ ttsl::hash::hash_t PerTokenCastBackDeviceOperation::compute_program_hash(
         attrs,
         tensor_args.input_e4m3.dtype(),
         tensor_args.input_e4m3.memory_config(),
+        // Scale dtype selects the compute datapath (bf16 vs fp32), so it must key the program cache.
+        tensor_args.input_scale.dtype(),
         tensor_args.input_scale.memory_config(),
         tensor_args.input_e4m3.logical_shape(),
         tensor_args.input_scale.logical_shape(),
