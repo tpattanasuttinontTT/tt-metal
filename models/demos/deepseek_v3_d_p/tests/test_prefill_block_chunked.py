@@ -32,7 +32,9 @@ from safetensors import safe_open
 import ttnn
 from models.common.utility_functions import is_blackhole, profiler
 from models.demos.deepseek_v3_d_p.reference.deepseek_v3_config import DeepSeekV3Config
+from models.demos.deepseek_v3_d_p.reference.glm_5_1_config import GLM51Config
 from models.demos.deepseek_v3_d_p.reference.kimi_k2_6_config import KimiK26Config
+from models.demos.deepseek_v3_d_p.tt.mla.indexer import resolve_has_indexer
 from models.demos.deepseek_v3_d_p.tt.mla.rope import RotarySetup
 from models.demos.deepseek_v3_d_p.tt.mla.utils import blockcyclic_positions, rotated_chip_positions
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import create_fabric_router_config
@@ -962,4 +964,224 @@ def test_kimi_prefill_block_chunked_padded(
 ):
     run_chunked_block_padded(
         variant, config_only, mesh_device, weight_cache_path, splits, layer_idx, gate_fallback_mode, num_links, topology
+    )
+
+
+# ---------------------------------------------------------------------------
+# GLM DSA indexer-K teacher-forced check
+# ---------------------------------------------------------------------------
+# Feeds the golden decoder_output of layer_idx-1 as the block input (teacher-forced -> no cross-layer
+# accumulation) and PCCs the device indexer-K cache + KVPE cache + block output against layer_idx's golden
+# from the chunked_group_a_v1 indexer-kcache vLLM trace (PREFILL_TRACE_DIR). The PCC here (teacher-forced,
+# expected ~1.0) isolates the per-layer op accuracy; contrast it with the chained transformer's per-layer
+# PCC (which accumulates) to confirm the deep-layer sag is accumulation, not an indexer bug. The indexer_k
+# golden is captured only for the DSA full-indexer layers (glm_5_1: all; glm_5_2: 0-2 + every 4th).
+
+
+def _load_sharded_rows(tensor_dir: Path, key: str, total_len: int) -> torch.Tensor:
+    """Read rows [:total_len] of `key` from a chunked_group_a_v1 shard dir (rows_<s>_<e>.safetensors)."""
+    parts = []
+    for shard in sorted(tensor_dir.glob("rows_*.safetensors")):
+        s, e = (int(x) for x in shard.stem.split("_")[1:3])
+        if s >= total_len:
+            continue
+        with safe_open(shard, framework="pt") as f:
+            parts.append(f.get_slice(key)[: min(total_len, e) - s].to(torch.float32))
+    assert parts, f"no shards in {tensor_dir}"
+    return torch.cat(parts, dim=0)[:total_len]
+
+
+def run_chunked_block_glm_indexer(
+    variant, config, mesh_device, weight_cache_path, n_chunks, layer_idx, num_links, topology
+):
+    if weight_cache_path is None:
+        pytest.skip(f"pretrained weights unavailable (set {variant.ttnn_cache_env} + {variant.env_var})")
+    if not resolve_has_indexer(config):
+        pytest.skip("indexer-K teacher-forced test is DSA-only (glm_5_1 / glm_5_2)")
+    trace_dir = _resolve_trace_dir(variant)
+    if not trace_dir.exists():
+        pytest.skip(f"golden trace not found: {trace_dir}")
+    idx_golden = trace_dir / "dsa" / f"indexer_k_layer_{layer_idx}"
+    if not idx_golden.exists():
+        pytest.skip(f"no indexer_k golden for layer {layer_idx} (not a captured full-indexer layer)")
+    assert layer_idx >= 1, "teacher-forcing needs layer_idx-1's decoder output"
+
+    sp_axis, tp_axis = 0, 1
+    mesh_shape = list(mesh_device.shape)
+    sp, tp = mesh_shape[sp_axis], mesh_shape[tp_axis]
+    assert (sp, tp) == (8, 4), f"this test targets mesh-8x4, got {mesh_shape}"
+    chunk_local = CHUNK // sp
+    total_len = n_chunks * CHUNK
+    assert total_len <= SEQ_CACHE
+    emb_dim = config.hidden_size
+    kvpe_dim = config.qk_rope_head_dim + config.kv_lora_rank
+    kv_lora = config.kv_lora_rank
+    idx_dim = config.index_head_dim
+    idx_rope = idx_dim // 2  # [rope | nope]; both compare directly for GLM (natively interleaved)
+    config.max_seq_len = SEQ_CACHE
+    is_dense = layer_idx < variant.model_config.NUM_DENSE_LAYERS
+
+    logger.info(f"glm indexer block (teacher-forced): layer={layer_idx} n_chunks={n_chunks} total_len={total_len}")
+    io = trace_dir / "decoder_io"
+    input_hidden = _load_sharded_rows(
+        io / f"decoder_output_layer_{layer_idx - 1}", f"decoder_output_layer_{layer_idx - 1}", total_len
+    )
+    ref_out = _load_sharded_rows(
+        io / f"decoder_output_layer_{layer_idx}", f"decoder_output_layer_{layer_idx}", total_len
+    )
+    g_idx = _load_sharded_rows(idx_golden, f"indexer_k_layer_{layer_idx}", total_len)
+    g_post = _load_sharded_rows(
+        trace_dir / "kv_cache" / f"layer_{layer_idx}", f"kv_post_transform_layer_{layer_idx}", total_len
+    )
+
+    effective_cache_path = weight_cache_path / f"{sp}x{tp}"
+    init_checker(effective_cache_path)
+    experts_per_chip = variant.model_config.NUM_ROUTED_EXPERTS // (sp * tp)
+    assert TtPrefillBlock.check_cache_complete(
+        effective_cache_path, layer_idx, is_dense=is_dense, experts_per_chip=experts_per_chip
+    ), f"TTNN cache incomplete for layer {layer_idx} at {effective_cache_path}"
+
+    block = TtPrefillBlock(
+        mesh_device=mesh_device,
+        config=config,
+        model_cfg=variant.model_config,
+        state_dict={},
+        layer_idx=layer_idx,
+        seq_len=CHUNK,
+        max_seq_len=SEQ_CACHE,
+        dispatch_buffer_capacity_factor=8,
+        num_links=num_links,
+        topology=topology,
+        sp_axis=sp_axis,
+        tp_axis=tp_axis,
+        is_balanced=False,
+        gate_fallback_mode=GateComputeMode.DEVICE_FP32,
+        weight_cache_path=effective_cache_path,
+        is_chunked=True,
+        slot_num=1,
+        layer_num=1,
+        routing_use_l1_small_for_semaphores=True,
+    )
+    ttnn.synchronize_device(mesh_device)
+
+    rope_setup = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False)
+    indexed_rope = rope_setup.get_rope_tensors_indexed(cache_seq_len_global=SEQ_CACHE, chunk_size_global=CHUNK)
+    tt_kvpe_cache = init_kvpe_cache(
+        kvpe_cache_head_dim=kvpe_dim,
+        mesh_device=mesh_device,
+        seq_len=SEQ_CACHE,
+        mesh_shape=mesh_shape,
+        sp_axis=sp_axis,
+        num_kvpe_cache_layers=1,
+        num_users=1,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+    )
+    tt_index_kv_cache = init_kvpe_cache(
+        kvpe_cache_head_dim=idx_dim,
+        mesh_device=mesh_device,
+        seq_len=SEQ_CACHE,
+        mesh_shape=mesh_shape,
+        sp_axis=sp_axis,
+        num_kvpe_cache_layers=1,
+        num_users=1,
+        dtype=ttnn.bfloat8_b,
+    )
+
+    hidden_shard_dims = [None, None]
+    hidden_shard_dims[sp_axis] = -2
+    hidden_shard_dims[tp_axis] = -1
+    out_concat_dims = [None, None]
+    out_concat_dims[sp_axis] = -2
+    out_concat_dims[tp_axis] = -1
+    out_accum = torch.zeros(total_len, emb_dim, dtype=torch.float32)
+
+    mesh_device.enable_program_cache()
+    for c in range(n_chunks):
+        kv_actual = c * CHUNK
+        positions = rotated_chip_positions(kv_actual, sp, chunk_local)
+        flat = torch.tensor([positions[ch][r] for ch in range(sp) for r in range(chunk_local)], dtype=torch.long)
+        chunk_in = input_hidden[flat].reshape(1, 1, CHUNK, emb_dim)
+        tt_h = ttnn.from_torch(
+            chunk_in,
+            device=mesh_device,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_shape), dims=hidden_shard_dims),
+        )
+        tt_out, _ = block.forward(
+            tt_h,
+            indexed_rope,
+            tt_kvpe_cache,
+            cache_layer_idx=0,
+            actual_start=kv_actual,
+            actual_end=kv_actual + CHUNK,
+            cache_user_id=0,
+            return_kv_intermediates=True,
+            index_kv_cache=tt_index_kv_cache,
+        )
+        out_accum[flat] = ttnn.to_torch(
+            tt_out,
+            mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=out_concat_dims, mesh_shape=mesh_device.shape),
+        ).to(torch.float32)[0, 0]
+        ttnn.synchronize_device(mesh_device)
+        logger.info(f"  chunk {c} done (kv_actual={kv_actual})")
+
+    p = blockcyclic_positions(sp, CHUNK, SEQ_CACHE)
+
+    def _unrotate(tt_cache, dim):
+        cache = ttnn.to_torch(
+            tt_cache, mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=(2, 1), mesh_shape=mesh_device.shape)
+        ).to(torch.float32)[:, :1][0, 0]
+        nat = torch.empty(SEQ_CACHE, dim, dtype=torch.float32)
+        nat[p] = cache
+        return nat[:total_len]
+
+    dev_idx = _unrotate(tt_index_kv_cache, idx_dim)
+    dev_kvpe = _unrotate(tt_kvpe_cache, kvpe_dim)
+    _, out_pcc = comp_pcc(ref_out, out_accum)
+    _, idx_nope = comp_pcc(g_idx[:, idx_rope:], dev_idx[:, idx_rope:])
+    _, idx_rope_pcc = comp_pcc(g_idx[:, :idx_rope], dev_idx[:, :idx_rope])
+    _, kv_nope = comp_pcc(g_post[:, :kv_lora], dev_kvpe[:, :kv_lora])
+    _, kv_pe = comp_pcc(_interleave_pe(g_post[:, kv_lora:]), dev_kvpe[:, kv_lora:])
+    logger.info(f"[glm teacher-forced L{layer_idx}] block output PCC vs decoder_output: {out_pcc:.6f}")
+    logger.info(f"[glm teacher-forced L{layer_idx}] indexer-K PCC: nope={idx_nope:.6f} rope={idx_rope_pcc:.6f}")
+    logger.info(f"[glm teacher-forced L{layer_idx}] KVPE PCC: nope={kv_nope:.6f} pe(interleaved)={kv_pe:.6f}")
+    # Teacher-forced single layer -> expect high PCC (op accuracy, no cross-layer accumulation).
+    assert out_pcc >= 0.98, f"teacher-forced block output PCC {out_pcc:.6f} < 0.98"
+    assert min(idx_nope, idx_rope_pcc) >= 0.98, f"teacher-forced indexer-K PCC {min(idx_nope, idx_rope_pcc):.6f} < 0.98"
+    logger.success(
+        f"glm teacher-forced L{layer_idx}: output={out_pcc:.4f} indexer-K min={min(idx_nope, idx_rope_pcc):.4f}"
+    )
+
+
+@pytest.mark.parametrize("n_chunks", [11], ids=["chunks11"])
+@pytest.mark.parametrize("layer_idx", [6, 30, 62, 74], ids=lambda l: f"L{l}")
+@pytest.mark.parametrize(
+    "mesh_device, device_params, num_links, topology",
+    [
+        pytest.param(
+            (8, 4),
+            {
+                "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+                "fabric_router_config": create_fabric_router_config(max_payload_size=GLM51Config.FABRIC_PAYLOAD_SIZE),
+                "l1_small_size": 512,
+            },
+            2,
+            ttnn.Topology.Linear,
+            marks=pytest.mark.requires_mesh_topology(mesh_shape=(8, 4), topology="mesh-8x4"),
+            id="mesh-8x4",
+        ),
+    ],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("variant", ["glm_5_2"], indirect=True, ids=["glm52"])
+@pytest.mark.skipif(not is_blackhole(), reason="GLM DSA (indexer) is Blackhole-only")
+@pytest.mark.timeout(0)
+def test_glm_prefill_block_indexer_teacher_forced(
+    variant, config_only, mesh_device, device_params, weight_cache_path, n_chunks, layer_idx, num_links, topology
+):
+    run_chunked_block_glm_indexer(
+        variant, config_only, mesh_device, weight_cache_path, n_chunks, layer_idx, num_links, topology
     )
