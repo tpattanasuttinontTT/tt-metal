@@ -457,9 +457,10 @@ class TtIndexer:
         on the query axis (each chip scores its own S/sp rows; no Q/W all-gather). Fully on-device:
         stems, RoPE, cache, logits, topk — no host.
 
-        ``index_kv_cache`` (block-cyclic path): the persistent per-user key cache, allocated by the caller and
-        passed in every call — the same ownership as ttMLA's KVPE ``kvpe_cache``. Required for the block-cyclic
-        path (the indexer never self-allocates it); ignored by the natural (single-shot) path.
+        ``index_kv_cache``: the persistent per-user key cache, allocated by the caller and passed in every
+        call — the same ownership as ttMLA's KVPE ``kvpe_cache``. ALWAYS required (the indexer never
+        self-allocates it): the indexer is always block-cyclic, and single-shot is folded onto that path as
+        one full-seq chunk at offset 0, so there is no natural path that skips the cache.
 
         ``qr`` is the shared q_a latent (q_a_proj + TP all-reduce + q_a_layernorm) — ttMLA computes it once
         and passes it in; the indexer applies wq_b to it (no q_a stem of its own). ``qr`` is NOT deallocated
@@ -467,10 +468,9 @@ class TtIndexer:
         (write_k) and the per-head weights (weights_proj). (write_k is called internally here; ttMLA.forward
         only ever calls self._indexer.forward — it never calls write_k directly.)
 
-        Block-cyclic path (GLM/DS chunked): ``rope_tensors`` (the MLA's block-cyclic indexed cos/sin/trans)
-        and ``cache_user_id`` (per-user slot) drive the per-user block-cyclic key cache + block-cyclic
-        scoring. Scoring currently spans the full preallocated cache width (see the kv_len TODO below).
-        Natural path ignores rope_tensors/cache_user_id."""
+        ``rope_tensors`` (the MLA's block-cyclic indexed cos/sin/trans) and ``cache_user_id`` (per-user slot)
+        drive the per-user block-cyclic key cache + block-cyclic scoring. Scoring currently spans the full
+        preallocated cache width (see the kv_len TODO below)."""
         a = self.index_args
         glob = seq_len * self.sp_factor  # global query/key count this chunk
         end_pos = start_pos + glob

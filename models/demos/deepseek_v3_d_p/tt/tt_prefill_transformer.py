@@ -321,8 +321,11 @@ class TtPrefillTransformer(LightweightModule):
                 emb_dim/tp] hidden-state activation handed over from the previous rank.
             kvpe_cache: externally created KVPE cache [num_layers, 1, seq_len_local, head_dim];
                         each layer writes to its own slot via cache_layer_idx
-            index_kv_cache: sparse-DSA chunked only — per-layer list of block-cyclic indexer key caches
-                        (the indexer is single-layer, so layers can't share one tensor). None otherwise.
+            index_kv_cache: sparse-DSA (v3.2 / GLM) — the caller-owned, layer-stacked block-cyclic indexer
+                        key cache [num_users * num_layers, 1, T, D_idx] (SP-sharded on the seq axis), same
+                        ownership as kvpe_cache. Required for EVERY sparse forward — chunked AND single-shot
+                        (folded onto the block-cyclic path); the indexer never self-allocates it. None only
+                        for dense (non-sparse) variants.
             return_intermediates: if True, sync + snapshot to host after each stage
             read_profiler: if True, read TTNN profiler after each layer to avoid profiler buffer overflows
             temperature: Temperature for sampling. Can be a single float or list of floats.
