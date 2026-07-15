@@ -26,6 +26,9 @@ except ModuleNotFoundError:  # pragma: no cover - handled in load_config
 
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 MAX_SLACK_TEXT_LENGTH = 35000
+MAX_SLACK_TABLE_ROWS = 100
+MAX_SLACK_TABLE_CHARS = 9500
+SLACK_TABLE_DATA_ROWS_PER_MESSAGE = 40
 STATE_SCHEMA_VERSION = 1
 SIGNATURE_VERSION = "runner-failure-signatures-2026-07-14-v1"
 NON_FAILED_CONCLUSIONS = {"success", "skipped", "cancelled"}
@@ -449,16 +452,6 @@ def workflow_runs_endpoint(workflow: WorkflowTarget, since: datetime) -> str:
     return f"repos/{workflow.owner_repo}/actions/workflows/{workflow_id}/runs?{query}"
 
 
-def repository_runs_endpoint(owner_repo: str, since: datetime) -> str:
-    query = urlencode(
-        {
-            "per_page": "100",
-            "created": f">={format_utc(since)}",
-        }
-    )
-    return f"repos/{owner_repo}/actions/runs?{query}"
-
-
 def workflow_run_jobs_endpoint(owner_repo: str, run_id: str) -> str:
     query = urlencode({"filter": "all", "per_page": "100"})
     return f"repos/{owner_repo}/actions/runs/{run_id}/jobs?{query}"
@@ -546,86 +539,6 @@ def list_recent_jobs(
         print(
             f"Kept {kept_count} job(s) for {workflow.name}; "
             f"filtered out {filtered_count} job(s)."
-        )
-
-    return sorted(
-        recent_jobs,
-        key=lambda job: parse_github_time(job.started_at),
-        reverse=True,
-    )
-
-
-def list_recent_jobs_for_runners(
-    *,
-    owner_repos: list[str],
-    runner_names: set[str],
-    since: datetime,
-    gh_timeout: int,
-) -> list[RecentJob]:
-    if not runner_names:
-        return []
-
-    recent_jobs: list[RecentJob] = []
-    seen_jobs: set[tuple[str, str]] = set()
-    folded_runner_names = {runner.casefold() for runner in runner_names}
-
-    for owner_repo in owner_repos:
-        runs_response = gh_api_json(
-            repository_runs_endpoint(owner_repo, since),
-            paginate=True,
-            timeout=gh_timeout,
-        )
-        runs = paginated_items(runs_response, "workflow_runs")
-        kept_count = 0
-        job_count = 0
-        print(
-            f"Found {len(runs)} recent repo run(s) in {owner_repo} "
-            "for affected runner follow-up."
-        )
-
-        for run in runs:
-            run_id = str(run.get("id") or "")
-            if not run_id:
-                continue
-
-            jobs_response = gh_api_json(
-                workflow_run_jobs_endpoint(owner_repo, run_id),
-                paginate=True,
-                timeout=gh_timeout,
-            )
-            workflow_name = str(
-                run.get("name") or run.get("display_title") or "unknown workflow"
-            )
-            workflow_id = str(run.get("path") or run.get("workflow_id") or "")
-
-            for job in paginated_items(jobs_response, "jobs"):
-                job_id = str(job.get("id") or "")
-                if not job_id:
-                    continue
-                job_count += 1
-
-                runner_name = str(job.get("runner_name") or "")
-                if runner_name.casefold() not in folded_runner_names:
-                    continue
-
-                job_key = (owner_repo, job_id)
-                if job_key in seen_jobs:
-                    continue
-                seen_jobs.add(job_key)
-                kept_count += 1
-                recent_jobs.append(
-                    recent_job_from_api(
-                        owner_repo=owner_repo,
-                        workflow_name=workflow_name,
-                        workflow_id=workflow_id,
-                        run=run,
-                        job=job,
-                    )
-                )
-
-        print(
-            f"Kept {kept_count} affected-runner job(s) from {job_count} "
-            f"recent job(s) in {owner_repo}."
         )
 
     return sorted(
@@ -830,8 +743,7 @@ def should_scan_log_for_full_table(job: RecentJob) -> bool:
 
 def full_runner_log_table_results(
     *,
-    owner_repos: list[str],
-    since: datetime,
+    recent_jobs: list[RecentJob],
     initial_scan_results: list[JobScanResult],
     failures: list[JobScanResult],
     gh_timeout: int,
@@ -845,12 +757,20 @@ def full_runner_log_table_results(
     if not affected_runners:
         return []
 
-    table_jobs = list_recent_jobs_for_runners(
-        owner_repos=owner_repos,
-        runner_names=affected_runners,
-        since=since,
-        gh_timeout=gh_timeout,
-    )
+    table_jobs = [
+        job
+        for job in recent_jobs
+        if runner_name_for_job(job) in affected_runners
+    ]
+    initial_jobs_by_key = {
+        job_state_key(result.job): result.job
+        for result in initial_scan_results
+        if runner_name_for_job(result.job) in affected_runners
+    }
+    table_jobs = [
+        initial_jobs_by_key.get(job_state_key(job), job)
+        for job in table_jobs
+    ]
     table_job_keys = {job_state_key(job) for job in table_jobs}
     for result in initial_scan_results:
         if (
@@ -1248,7 +1168,11 @@ def truncate_for_slack(value: str, max_length: int = MAX_SLACK_TEXT_LENGTH) -> s
 
 
 def post_slack_message(
-    slack_config: SlackConfig, text: str, *, thread_ts: str | None = None
+    slack_config: SlackConfig,
+    text: str,
+    *,
+    thread_ts: str | None = None,
+    blocks: list[dict[str, Any]] | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "channel": slack_config.channel,
@@ -1256,6 +1180,8 @@ def post_slack_message(
         "unfurl_links": False,
         "unfurl_media": False,
     }
+    if blocks is not None:
+        payload["blocks"] = blocks
     if thread_ts:
         payload["thread_ts"] = thread_ts
 
@@ -1287,6 +1213,134 @@ def post_slack_message(
     if not isinstance(ts, str) or not ts:
         raise RuntimeError("Slack post succeeded but response did not include ts.")
     return ts
+
+
+def slack_raw_text_cell(value: str) -> dict[str, str]:
+    return {"type": "raw_text", "text": value}
+
+
+def slack_link_cell(url: str, label: str) -> dict[str, Any]:
+    if not url:
+        return slack_raw_text_cell(label)
+    return {
+        "type": "rich_text",
+        "elements": [
+            {
+                "type": "rich_text_section",
+                "elements": [
+                    {
+                        "type": "link",
+                        "url": url,
+                        "text": label,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def slack_table_cell_text(cell: dict[str, Any]) -> str:
+    if cell.get("type") == "raw_text":
+        return str(cell.get("text") or "")
+
+    pieces: list[str] = []
+    for element in cell.get("elements") or []:
+        for child in element.get("elements") or []:
+            pieces.append(str(child.get("text") or child.get("url") or ""))
+    return "".join(pieces)
+
+
+def slack_table_rows_text_length(rows: list[list[dict[str, Any]]]) -> int:
+    return sum(len(slack_table_cell_text(cell)) for row in rows for cell in row)
+
+
+def slack_flag_cell(value: str) -> dict[str, str]:
+    return slack_raw_text_cell(value or "-")
+
+
+def compact_started_at(value: str) -> str:
+    if len(value) >= len("YYYY-MM-DDTHH:MM"):
+        return value[:16].replace("T", " ")
+    return value or "unknown"
+
+
+def workflow_job_label(job: RecentJob) -> str:
+    if job.workflow:
+        return f"{job.workflow} / {job.name}"
+    return job.name
+
+
+def slack_runner_table_header() -> list[dict[str, str]]:
+    return [
+        slack_raw_text_cell("Job"),
+        slack_raw_text_cell("Status"),
+        slack_raw_text_cell("Started"),
+        slack_raw_text_cell("Log"),
+        slack_raw_text_cell("TLB"),
+        slack_raw_text_cell("Missing"),
+        slack_raw_text_cell("Fabric"),
+        slack_raw_text_cell("Disk"),
+        slack_raw_text_cell("Links"),
+        slack_raw_text_cell("Workflow / job"),
+    ]
+
+
+def slack_runner_table_row(result: JobScanResult) -> list[dict[str, Any]]:
+    job = result.job
+    fabric_flag = compact_signature_cell(result, "Fabric link down (MGD topology)")
+    return [
+        slack_link_cell(job.html_url, job.job_id or "open"),
+        slack_raw_text_cell(job.conclusion or job.status or "unknown"),
+        slack_raw_text_cell(compact_started_at(job.started_at)),
+        slack_flag_cell("Y" if result.log_checked else "N"),
+        slack_flag_cell(compact_signature_cell(result, "TLB error")),
+        slack_flag_cell(compact_signature_cell(result, "Missing devices")),
+        slack_flag_cell(fabric_flag),
+        slack_flag_cell(compact_signature_cell(result, "Out of disk")),
+        slack_raw_text_cell(result.fabric_missing_links or "-"),
+        slack_raw_text_cell(workflow_job_label(job)),
+    ]
+
+
+def chunk_slack_table_rows(
+    rows: list[list[dict[str, Any]]],
+) -> list[list[list[dict[str, Any]]]]:
+    chunks: list[list[list[dict[str, Any]]]] = []
+    current: list[list[dict[str, Any]]] = []
+    header = slack_runner_table_header()
+
+    for row in rows:
+        candidate = [header, *current, row]
+        would_exceed_rows = len(candidate) > MAX_SLACK_TABLE_ROWS
+        would_exceed_chunk_rows = len(current) >= SLACK_TABLE_DATA_ROWS_PER_MESSAGE
+        would_exceed_chars = slack_table_rows_text_length(candidate) > MAX_SLACK_TABLE_CHARS
+        if current and (would_exceed_rows or would_exceed_chunk_rows or would_exceed_chars):
+            chunks.append(current)
+            current = []
+        current.append(row)
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def slack_runner_table_block(rows: list[list[dict[str, Any]]]) -> dict[str, Any]:
+    return {
+        "type": "table",
+        "column_settings": [
+            {"is_wrapped": False},
+            {"is_wrapped": False},
+            {"is_wrapped": False},
+            {"align": "center"},
+            {"align": "center"},
+            {"align": "center"},
+            {"align": "center"},
+            {"align": "center"},
+            {"is_wrapped": True},
+            {"is_wrapped": True},
+        ],
+        "rows": [slack_runner_table_header(), *rows],
+    }
 
 
 def format_triggering_jobs_for_slack(
@@ -1334,7 +1388,7 @@ def format_runner_log_table_for_slack(
 ) -> str:
     lines = [
         f"Full log signature report for `{slack_escape(runner)}` "
-        "(`check-logs all` style, all recent repo jobs).",
+        "Configured workflows only. To pin down runner failures, run the scanner locally.",
         "Flags use `Y`/`N`; `-` means the log was not checked.",
     ]
     for result in results:
@@ -1351,6 +1405,52 @@ def format_runner_log_table_for_slack(
             f"{slack_escape(job.workflow)} / {slack_escape(job.name)}"
         )
     return truncate_for_slack("\n".join(lines))
+
+
+def post_runner_log_table_for_slack(
+    slack_config: SlackConfig,
+    *,
+    runner: str,
+    results: list[JobScanResult],
+    thread_ts: str,
+) -> None:
+    heading = (
+        f"Full log signature table for `{slack_escape(runner)}`: "
+        f"{len(results)} recent configured-workflow job(s) found for this runner. "
+        "Flags use Y/N; '-' means no signature value."
+    )
+    post_slack_message(slack_config, heading, thread_ts=thread_ts)
+
+    table_rows = [slack_runner_table_row(result) for result in results]
+    if not table_rows:
+        return
+
+    chunks = chunk_slack_table_rows(table_rows)
+    row_offset = 0
+    for chunk in chunks:
+        start_row = row_offset + 1
+        end_row = start_row + len(chunk) - 1
+        row_offset += len(chunk)
+        fallback_text = (
+            f"Runner log signature table for {runner}, "
+            f"rows {start_row}-{end_row} of {len(table_rows)}."
+        )
+        try:
+            post_slack_message(
+                slack_config,
+                fallback_text,
+                thread_ts=thread_ts,
+                blocks=[slack_runner_table_block(chunk)],
+            )
+        except RuntimeError as exc:
+            if "invalid_blocks" not in str(exc):
+                raise
+            post_slack_message(
+                slack_config,
+                format_runner_log_table_for_slack(runner, results),
+                thread_ts=thread_ts,
+            )
+            return
 
 
 def post_slack_alerts(
@@ -1382,11 +1482,10 @@ def post_slack_alerts(
             format_triggering_jobs_for_slack(runner, runner_results),
             thread_ts=thread_ts,
         )
-        post_slack_message(
+        post_runner_log_table_for_slack(
             slack_config,
-            format_runner_log_table_for_slack(
-                runner, table_results_by_runner.get(runner, runner_results)
-            ),
+            runner=runner,
+            results=table_results_by_runner.get(runner, runner_results),
             thread_ts=thread_ts,
         )
         print(f"Posted Slack summary for {runner}.")
@@ -1445,8 +1544,7 @@ def main() -> int:
     save_state(args.state_out, state)
     failures = [result for result in scan_results if result.signature_labels]
     runner_log_table_results = full_runner_log_table_results(
-        owner_repos=sorted({workflow.owner_repo for workflow in workflows}),
-        since=since,
+        recent_jobs=recent_jobs,
         initial_scan_results=scan_results,
         failures=failures,
         gh_timeout=args.gh_timeout,
