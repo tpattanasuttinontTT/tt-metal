@@ -710,6 +710,10 @@ template <
     bool CLAMP_NEGATIVE = true,
     bool is_fp32_dest_acc_en = false>
 void exp_init() {
+    // Re-establish the hoisted general SFPU state (config reg + ADDR_MOD_7) here: SDPA interleaves matmul
+    // between compute_kernel_hw_startup and exp, clobbering it, so exp needs it re-set right before use
+    // (matches main, where the generic init prefix ran on every exp_tile_init).
+    _llk_math_eltwise_unary_sfpu_init_once_();
     math::reset_counters(p_setrwc::SET_ABD_F);
     if constexpr (APPROXIMATION_MODE && CLAMP_NEGATIVE) {
         // Algorithm is adapted from:
