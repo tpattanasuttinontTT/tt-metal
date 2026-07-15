@@ -52,13 +52,13 @@ from helpers.utils import passed_test
         MathOperation.SfpuElwadd,
         MathOperation.SfpuElwsub,
         MathOperation.SfpuElwmul,
-        # Disabled: failing due to very small differences in generated stimuli
-        # MathOperation.SfpuElwLt,
-        # MathOperation.SfpuElwGt,
-        # MathOperation.SfpuElwLe,
-        # MathOperation.SfpuElwGe,
-        # MathOperation.SfpuElwEq,
-        # MathOperation.SfpuElwNe,
+        # fp32 total-order comparisons (sfpi calculate_binary_comp_fp32_*)
+        MathOperation.SfpuElwLt,
+        MathOperation.SfpuElwGt,
+        MathOperation.SfpuElwLe,
+        MathOperation.SfpuElwGe,
+        MathOperation.SfpuElwEq,
+        MathOperation.SfpuElwNe,
     ],
     dest_acc=[DestAccumulation.No, DestAccumulation.Yes],
 )
