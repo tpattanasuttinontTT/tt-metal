@@ -449,9 +449,45 @@ def workflow_runs_endpoint(workflow: WorkflowTarget, since: datetime) -> str:
     return f"repos/{workflow.owner_repo}/actions/workflows/{workflow_id}/runs?{query}"
 
 
+def repository_runs_endpoint(owner_repo: str, since: datetime) -> str:
+    query = urlencode(
+        {
+            "per_page": "100",
+            "created": f">={format_utc(since)}",
+        }
+    )
+    return f"repos/{owner_repo}/actions/runs?{query}"
+
+
 def workflow_run_jobs_endpoint(owner_repo: str, run_id: str) -> str:
     query = urlencode({"filter": "all", "per_page": "100"})
     return f"repos/{owner_repo}/actions/runs/{run_id}/jobs?{query}"
+
+
+def recent_job_from_api(
+    *,
+    owner_repo: str,
+    workflow_name: str,
+    workflow_id: str,
+    run: dict[str, Any],
+    job: dict[str, Any],
+) -> RecentJob:
+    return RecentJob(
+        owner_repo=owner_repo,
+        workflow=workflow_name,
+        workflow_id=workflow_id,
+        run_id=str(run.get("id") or ""),
+        run_attempt=str(run.get("run_attempt") or ""),
+        run_url=str(run.get("html_url") or ""),
+        job_id=str(job.get("id") or ""),
+        name=str(job.get("name") or ""),
+        runner_name=str(job.get("runner_name") or ""),
+        status=str(job.get("status") or ""),
+        conclusion=str(job.get("conclusion") or ""),
+        html_url=str(job.get("html_url") or ""),
+        started_at=str(job.get("started_at") or ""),
+        completed_at=str(job.get("completed_at") or ""),
+    )
 
 
 def list_recent_jobs(
@@ -498,27 +534,98 @@ def list_recent_jobs(
                 kept_count += 1
 
                 recent_jobs.append(
-                    RecentJob(
+                    recent_job_from_api(
                         owner_repo=workflow.owner_repo,
-                        workflow=workflow.name,
+                        workflow_name=workflow.name,
                         workflow_id=workflow.workflow_id,
-                        run_id=run_id,
-                        run_attempt=str(run.get("run_attempt") or ""),
-                        run_url=str(run.get("html_url") or ""),
-                        job_id=job_id,
-                        name=job_name,
-                        runner_name=str(job.get("runner_name") or ""),
-                        status=str(job.get("status") or ""),
-                        conclusion=str(job.get("conclusion") or ""),
-                        html_url=str(job.get("html_url") or ""),
-                        started_at=str(job.get("started_at") or ""),
-                        completed_at=str(job.get("completed_at") or ""),
+                        run=run,
+                        job=job,
                     )
                 )
 
         print(
             f"Kept {kept_count} job(s) for {workflow.name}; "
             f"filtered out {filtered_count} job(s)."
+        )
+
+    return sorted(
+        recent_jobs,
+        key=lambda job: parse_github_time(job.started_at),
+        reverse=True,
+    )
+
+
+def list_recent_jobs_for_runners(
+    *,
+    owner_repos: list[str],
+    runner_names: set[str],
+    since: datetime,
+    gh_timeout: int,
+) -> list[RecentJob]:
+    if not runner_names:
+        return []
+
+    recent_jobs: list[RecentJob] = []
+    seen_jobs: set[tuple[str, str]] = set()
+    folded_runner_names = {runner.casefold() for runner in runner_names}
+
+    for owner_repo in owner_repos:
+        runs_response = gh_api_json(
+            repository_runs_endpoint(owner_repo, since),
+            paginate=True,
+            timeout=gh_timeout,
+        )
+        runs = paginated_items(runs_response, "workflow_runs")
+        kept_count = 0
+        job_count = 0
+        print(
+            f"Found {len(runs)} recent repo run(s) in {owner_repo} "
+            "for affected runner follow-up."
+        )
+
+        for run in runs:
+            run_id = str(run.get("id") or "")
+            if not run_id:
+                continue
+
+            jobs_response = gh_api_json(
+                workflow_run_jobs_endpoint(owner_repo, run_id),
+                paginate=True,
+                timeout=gh_timeout,
+            )
+            workflow_name = str(
+                run.get("name") or run.get("display_title") or "unknown workflow"
+            )
+            workflow_id = str(run.get("path") or run.get("workflow_id") or "")
+
+            for job in paginated_items(jobs_response, "jobs"):
+                job_id = str(job.get("id") or "")
+                if not job_id:
+                    continue
+                job_count += 1
+
+                runner_name = str(job.get("runner_name") or "")
+                if runner_name.casefold() not in folded_runner_names:
+                    continue
+
+                job_key = (owner_repo, job_id)
+                if job_key in seen_jobs:
+                    continue
+                seen_jobs.add(job_key)
+                kept_count += 1
+                recent_jobs.append(
+                    recent_job_from_api(
+                        owner_repo=owner_repo,
+                        workflow_name=workflow_name,
+                        workflow_id=workflow_id,
+                        run=run,
+                        job=job,
+                    )
+                )
+
+        print(
+            f"Kept {kept_count} affected-runner job(s) from {job_count} "
+            f"recent job(s) in {owner_repo}."
         )
 
     return sorted(
@@ -789,7 +896,8 @@ def should_scan_log_for_full_table(job: RecentJob) -> bool:
 
 def full_runner_log_table_results(
     *,
-    recent_jobs: list[RecentJob],
+    owner_repos: list[str],
+    since: datetime,
     initial_scan_results: list[JobScanResult],
     failures: list[JobScanResult],
     gh_timeout: int,
@@ -803,14 +911,26 @@ def full_runner_log_table_results(
     if not affected_runners:
         return []
 
+    table_jobs = list_recent_jobs_for_runners(
+        owner_repos=owner_repos,
+        runner_names=affected_runners,
+        since=since,
+        gh_timeout=gh_timeout,
+    )
+    table_job_keys = {job_state_key(job) for job in table_jobs}
+    for result in initial_scan_results:
+        if (
+            runner_name_for_job(result.job) in affected_runners
+            and job_state_key(result.job) not in table_job_keys
+        ):
+            table_jobs.append(result.job)
+            table_job_keys.add(job_state_key(result.job))
+
     results_by_key = {
         job_state_key(result.job): result
         for result in initial_scan_results
         if runner_name_for_job(result.job) in affected_runners
     }
-    table_jobs = [
-        job for job in recent_jobs if runner_name_for_job(job) in affected_runners
-    ]
     jobs_to_scan = [
         job
         for job in table_jobs
@@ -1317,7 +1437,7 @@ def format_runner_log_table_for_slack(
     )
     return (
         f"Full log signature table for `{slack_escape(runner)}` "
-        "(`check-logs all` style, configured workflows only):\n"
+        "(`check-logs all` style, all recent repo jobs):\n"
         f"{slack_code_block(table)}"
     )
 
@@ -1414,7 +1534,8 @@ def main() -> int:
     save_state(args.state_out, state)
     failures = [result for result in scan_results if result.signature_labels]
     runner_log_table_results = full_runner_log_table_results(
-        recent_jobs=recent_jobs,
+        owner_repos=sorted({workflow.owner_repo for workflow in workflows}),
+        since=since,
         initial_scan_results=scan_results,
         failures=failures,
         gh_timeout=args.gh_timeout,
