@@ -151,10 +151,13 @@ def _load_layer_rows(
     trace_dir: Path, layout: str, group: str, layer: int, key: str, start: int, end: int
 ) -> torch.Tensor:
     """Read trace tensor `key` rows [start:end] (float32) for `layer`, handling both layouts. `group`
-    is the logical bucket: "hidden_states" (decoder_io for Kimi) or "kv_cache"."""
+    is the logical bucket: "hidden_states" (decoder_io for Kimi), "kv_cache", or "dsa" (indexer-K,
+    stored as dsa/<key>/ where key == indexer_k_layer_<layer>, like decoder_io)."""
     if layout == _LAYOUT_CHUNKED_GROUP_A:
         if group == "hidden_states":
             tensor_dir = trace_dir / "decoder_io" / key
+        elif group == "dsa":
+            tensor_dir = trace_dir / "dsa" / key
         else:
             tensor_dir = trace_dir / "kv_cache" / f"layer_{layer}"
         return _read_sharded_rows(tensor_dir, key, start, end)
@@ -198,6 +201,43 @@ def _record_kv_cache_pcc(
         cache_min_pcc[i] = min(pcc_nope, pcc_pe)
         logger.info(f"  cache layer {i} PCC: nope={pcc_nope:.6f} pe(interleaved)={pcc_pe:.6f}")
     logger.info(f"KV cache min PCC across layers: {min(cache_min_pcc.values()):.6f}")
+
+
+def _record_indexer_k_cache_pcc(
+    trace_dir, layout, tt_index_kv_cache, mesh_device, sp, num_layers, seq_len_cache, total_len, index_head_dim
+):
+    """Record-only: gather the device DSA indexer-K cache, un-rotate the block-cyclic layout, and PCC
+    each captured layer's valid region [:total_len] against the golden dsa/indexer_k trace. The
+    index_head_dim key is [rope | nope] (rope = first half, indexed-RoPE; nope = second half, no rope);
+    BOTH compare directly because GLM's indexer RoPE is natively interleaved and the vLLM golden stores
+    that same basis (verified on device: the half-split reindex gives ~0 PCC, direct gives ~0.9999).
+    Same gather/un-rotate as the KVPE cache (caller-owned tensor, ConcatMesh2dToTensor dims=(2,1),
+    blockcyclic_positions). indexer_k is captured for a subset of layers (glm_5_1: all; glm_5_2: 0-2 +
+    every 4th) — layers without a golden are skipped. Does NOT assert; GLM DSA variants only."""
+    logger.info("Device indexer-K cache vs golden dsa/indexer_k (record-only):")
+    cache_full = ttnn.to_torch(
+        tt_index_kv_cache,
+        mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=(2, 1), mesh_shape=mesh_device.shape),
+    ).to(torch.float32)[
+        :, :1
+    ]  # [num_layers, 1, seq_len_cache, index_head_dim]
+    layers = [i for i in range(num_layers) if (trace_dir / "dsa" / f"indexer_k_layer_{i}").exists()]
+    if not layers:
+        logger.info("  (no indexer_k golden layers present -- skipping)")
+        return
+    p = blockcyclic_positions(sp, CHUNK, seq_len_cache)
+    rope = index_head_dim // 2  # [rope | nope]
+    idx_min_pcc = {}
+    for i in layers:
+        nat = torch.empty(seq_len_cache, index_head_dim, dtype=torch.float32)
+        nat[p] = cache_full[i, 0]  # un-rotate block-cyclic -> natural order
+        dev_cache = nat[:total_len]
+        g = _load_layer_rows(trace_dir, layout, "dsa", i, f"indexer_k_layer_{i}", 0, total_len)
+        _, pcc_nope = comp_pcc(g[:, rope:], dev_cache[:, rope:])
+        _, pcc_rope = comp_pcc(g[:, :rope], dev_cache[:, :rope])
+        idx_min_pcc[i] = min(pcc_nope, pcc_rope)
+        logger.info(f"  indexer cache layer {i} PCC: nope={pcc_nope:.6f} rope={pcc_rope:.6f}")
+    logger.info(f"Indexer-K cache min PCC across {len(layers)} captured layers: {min(idx_min_pcc.values()):.6f}")
 
 
 def run_chunked_transformer_padded(
@@ -588,6 +628,18 @@ def run_chunked_transformer(
         kvpe_dim,
         config.kv_lora_rank,
     )
+    if tt_index_kv_cache is not None and (trace_dir / "dsa" / "indexer_k_layer_0").exists():
+        _record_indexer_k_cache_pcc(
+            trace_dir,
+            layout,
+            tt_index_kv_cache,
+            mesh_device,
+            sp,
+            num_layers,
+            SEQ_CACHE,
+            total_len,
+            config.index_head_dim,
+        )
 
     profiler.end("total_test_time")
     logger.success(
