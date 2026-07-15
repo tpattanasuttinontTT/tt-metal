@@ -1,0 +1,141 @@
+name: "(triage) Runner Failure Report"
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_name:
+        description: "Runner/host name to report on"
+        required: true
+      hours:
+        description: "Number of hours to look back"
+        required: false
+        default: "24"
+      post_to_slack:
+        description: "Post the report to Slack"
+        required: false
+        type: boolean
+        default: true
+      slack_channel_id:
+        description: "Slack channel ID. Leave empty to use RUNNER_FAILURE_SCAN_CHANNEL."
+        required: false
+  workflow_call:
+    inputs:
+      runner_name:
+        required: true
+        type: string
+      hours:
+        required: false
+        type: string
+        default: "24"
+      post_to_slack:
+        required: false
+        type: boolean
+        default: true
+      slack_channel_id:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SLACK_BOT_TOKEN:
+        required: false
+      RUNNER_FAILURE_SCAN_CHANNEL:
+        required: false
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  RUNNER_FAILURE_SCAN_WORKFLOWS: |
+    # Jobs are included unless include_exact or include_prefixes is set.
+    # Exclusions are applied after inclusions.
+    repository: tenstorrent/tt-metal
+
+    workflows:
+      - name: vllm-nightly-tests
+        workflow_id: vllm-nightly-tests.yaml
+        include_prefixes:
+          - "vllm-tests /"
+
+      - name: all-model-tests
+        workflow_id: all-model-tests.yaml
+        exclude_exact:
+          - preflight
+          - build-artifact
+          - check-farbot
+          - check-harbor
+        exclude_prefixes:
+          - "build-artifact /"
+          - "check-farbot /"
+          - "check-harbor /"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        timeout-minutes: 20
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install scanner dependencies
+        run: python3 -m pip install PyYAML==6.0.2
+
+      - name: Build runner report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RUNNER_NAME: ${{ inputs.runner_name }}
+          HOURS: ${{ inputs.hours || '24' }}
+        run: |
+          mkdir -p out
+          printf '%s\n' "$RUNNER_FAILURE_SCAN_WORKFLOWS" > out/runner_failure_scan_workflows.yaml
+          python3 .github/scripts/runner_failure_report.py \
+            --config out/runner_failure_scan_workflows.yaml \
+            --hours "$HOURS" \
+            --runner-name "$RUNNER_NAME" \
+            --report-json out/runner_failure_report.json \
+            --report-md out/runner_failure_report.md
+
+      - name: Post Slack notification
+        if: always() && hashFiles('out/runner_failure_report.json') != ''
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DEFAULT_SLACK_CHANNEL: ${{ secrets.RUNNER_FAILURE_SCAN_CHANNEL }}
+          INPUT_SLACK_CHANNEL: ${{ inputs.slack_channel_id }}
+          POST_TO_SLACK: ${{ inputs.post_to_slack }}
+        run: |
+          if [[ "$POST_TO_SLACK" != "true" ]]; then
+            echo "Slack posting was not requested."
+            exit 0
+          fi
+
+          slack_channel="${INPUT_SLACK_CHANNEL:-$DEFAULT_SLACK_CHANNEL}"
+          if [[ -z "$slack_channel" ]]; then
+            echo "Slack posting requested, but no Slack channel is configured."
+            exit 0
+          fi
+
+          python3 .github/scripts/runner_failure_post_slack.py \
+            --runner-report-json out/runner_failure_report.json \
+            --slack-channel "$slack_channel"
+
+      - name: Add report to step summary
+        if: always() && hashFiles('out/runner_failure_report.md') != ''
+        run: cat out/runner_failure_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload runner failure report
+        if: always() && hashFiles('out/runner_failure_report.*') != ''
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: runner-failure-report-${{ github.run_id }}
+          path: |
+            out/runner_failure_report.json
+            out/runner_failure_report.md
+          retention-days: 14

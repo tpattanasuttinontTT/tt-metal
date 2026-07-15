@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""Post runner-failure reports to Slack."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib import error, request
+
+from runner_failure_common import (
+    JobScanResult,
+    RecentJob,
+    UNKNOWN_RUNNER,
+    format_signature_summary,
+)
+
+
+SLACK_API_URL = "https://slack.com/api/chat.postMessage"
+MAX_SLACK_TEXT_LENGTH = 35000
+MAX_SLACK_TABLE_ROWS = 100
+MAX_SLACK_TABLE_CHARS = 9500
+SLACK_TABLE_DATA_ROWS_PER_MESSAGE = 40
+
+
+@dataclass(frozen=True)
+class SlackConfig:
+    token: str
+    channel: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Post a completed runner-failure report to Slack."
+    )
+    parser.add_argument(
+        "--runner-report-json",
+        type=Path,
+        required=True,
+        help="Path to a completed single-runner report JSON.",
+    )
+    parser.add_argument(
+        "--slack-channel",
+        default=os.environ.get("RUNNER_FAILURE_SCAN_SLACK_CHANNEL"),
+        help="Slack channel ID for runner-failure summaries.",
+    )
+    return parser.parse_args()
+
+
+def slack_config_from_channel(slack_channel: str | None) -> SlackConfig | None:
+    if not slack_channel:
+        return None
+    token = os.environ.get("SLACK_BOT_TOKEN") or os.environ.get(
+        "RUNNER_FAILURE_SCAN_SLACK_BOT_TOKEN"
+    )
+    if not token:
+        print(
+            "warning: Slack channel is configured, but SLACK_BOT_TOKEN is not set; "
+            "skipping Slack notifications.",
+            file=sys.stderr,
+        )
+        return None
+    return SlackConfig(token=token, channel=slack_channel)
+
+
+def job_from_dict(value: dict[str, Any]) -> RecentJob:
+    return RecentJob(
+        owner_repo=str(value.get("owner_repo") or ""),
+        workflow=str(value.get("workflow") or ""),
+        workflow_id=str(value.get("workflow_id") or ""),
+        run_id=str(value.get("run_id") or ""),
+        run_attempt=str(value.get("run_attempt") or ""),
+        run_url=str(value.get("run_url") or ""),
+        job_id=str(value.get("job_id") or ""),
+        name=str(value.get("name") or ""),
+        runner_name=str(value.get("runner_name") or ""),
+        status=str(value.get("status") or ""),
+        conclusion=str(value.get("conclusion") or ""),
+        html_url=str(value.get("html_url") or ""),
+        started_at=str(value.get("started_at") or ""),
+        completed_at=str(value.get("completed_at") or ""),
+    )
+
+
+def scan_result_from_dict(value: dict[str, Any]) -> JobScanResult:
+    raw_signatures = value.get("signatures")
+    signatures: tuple[str, ...] = ()
+    if isinstance(raw_signatures, list):
+        signatures = tuple(str(item) for item in raw_signatures if item)
+    return JobScanResult(
+        job=job_from_dict(value),
+        log_status=str(value.get("log_status") or ""),
+        log_checked=bool(value.get("log_checked")),
+        signature_labels=signatures,
+        fabric_missing_links=str(value.get("fabric_missing_links") or ""),
+    )
+
+
+def load_report_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read report JSON {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Unable to parse report JSON {path}: {exc}") from exc
+
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Report JSON {path} must contain an object.")
+    return value
+
+
+def scan_results_from_report(report: dict[str, Any]) -> list[JobScanResult]:
+    values = report.get("scan_results")
+    if not isinstance(values, list):
+        return []
+    return [
+        scan_result_from_dict(value)
+        for value in values
+        if isinstance(value, dict)
+    ]
+
+
+def int_from_report(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def slack_escape(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def slack_link(url: str, label: str) -> str:
+    if not url:
+        return slack_escape(label)
+    return f"<{url}|{slack_escape(label)}>"
+
+
+def truncate_for_slack(value: str, max_length: int = MAX_SLACK_TEXT_LENGTH) -> str:
+    if len(value) <= max_length:
+        return value
+    suffix = "\n... truncated ..."
+    return value[: max_length - len(suffix)] + suffix
+
+
+def post_slack_message(
+    slack_config: SlackConfig,
+    text: str,
+    *,
+    thread_ts: str | None = None,
+    blocks: list[dict[str, Any]] | None = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "channel": slack_config.channel,
+        "text": truncate_for_slack(text),
+        "unfurl_links": False,
+        "unfurl_media": False,
+    }
+    if blocks is not None:
+        payload["blocks"] = blocks
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+
+    slack_request = request.Request(
+        SLACK_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {slack_config.token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(slack_request, timeout=30) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+    except error.URLError as exc:
+        raise RuntimeError(f"Slack post failed: {exc}") from exc
+
+    try:
+        response_json = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Slack returned non-JSON response: {response_body}") from exc
+
+    if not response_json.get("ok"):
+        slack_error = response_json.get("error") or "unknown_error"
+        raise RuntimeError(f"Slack post failed: {slack_error}")
+
+    ts = response_json.get("ts")
+    if not isinstance(ts, str) or not ts:
+        raise RuntimeError("Slack post succeeded but response did not include ts.")
+    return ts
+
+
+def slack_raw_text_cell(value: str) -> dict[str, str]:
+    return {"type": "raw_text", "text": value}
+
+
+def slack_link_cell(url: str, label: str) -> dict[str, Any]:
+    if not url:
+        return slack_raw_text_cell(label)
+    return {
+        "type": "rich_text",
+        "elements": [
+            {
+                "type": "rich_text_section",
+                "elements": [
+                    {
+                        "type": "link",
+                        "url": url,
+                        "text": label,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def slack_table_cell_text(cell: dict[str, Any]) -> str:
+    if cell.get("type") == "raw_text":
+        return str(cell.get("text") or "")
+
+    pieces: list[str] = []
+    for element in cell.get("elements") or []:
+        for child in element.get("elements") or []:
+            pieces.append(str(child.get("text") or child.get("url") or ""))
+    return "".join(pieces)
+
+
+def slack_table_rows_text_length(rows: list[list[dict[str, Any]]]) -> int:
+    return sum(len(slack_table_cell_text(cell)) for row in rows for cell in row)
+
+
+def slack_flag_cell(value: str) -> dict[str, str]:
+    return slack_raw_text_cell(value or "-")
+
+
+def compact_started_at(value: str) -> str:
+    if len(value) >= len("YYYY-MM-DDTHH:MM"):
+        return value[:16].replace("T", " ")
+    return value or "unknown"
+
+
+def workflow_job_label(job: RecentJob) -> str:
+    if job.workflow:
+        return f"{job.workflow} / {job.name}"
+    return job.name
+
+
+def slack_runner_table_header() -> list[dict[str, str]]:
+    return [
+        slack_raw_text_cell("Job"),
+        slack_raw_text_cell("Status"),
+        slack_raw_text_cell("Started"),
+        slack_raw_text_cell("Log"),
+        slack_raw_text_cell("TLB"),
+        slack_raw_text_cell("Missing"),
+        slack_raw_text_cell("Fabric"),
+        slack_raw_text_cell("Disk"),
+        slack_raw_text_cell("Links"),
+        slack_raw_text_cell("Workflow / job"),
+    ]
+
+
+def compact_signature_cell(result: JobScanResult, label: str) -> str:
+    if not result.log_checked:
+        return ""
+    return "Y" if label in result.signature_labels else "N"
+
+
+def slack_runner_table_row(result: JobScanResult) -> list[dict[str, Any]]:
+    job = result.job
+    fabric_flag = compact_signature_cell(result, "Fabric link down (MGD topology)")
+    return [
+        slack_link_cell(job.html_url, job.job_id or "open"),
+        slack_raw_text_cell(job.conclusion or job.status or "unknown"),
+        slack_raw_text_cell(compact_started_at(job.started_at)),
+        slack_flag_cell("Y" if result.log_checked else "N"),
+        slack_flag_cell(compact_signature_cell(result, "TLB error")),
+        slack_flag_cell(compact_signature_cell(result, "Missing devices")),
+        slack_flag_cell(fabric_flag),
+        slack_flag_cell(compact_signature_cell(result, "Out of disk")),
+        slack_raw_text_cell(result.fabric_missing_links or "-"),
+        slack_raw_text_cell(workflow_job_label(job)),
+    ]
+
+
+def chunk_slack_table_rows(
+    rows: list[list[dict[str, Any]]],
+) -> list[list[list[dict[str, Any]]]]:
+    chunks: list[list[list[dict[str, Any]]]] = []
+    current: list[list[dict[str, Any]]] = []
+    header = slack_runner_table_header()
+
+    for row in rows:
+        candidate = [header, *current, row]
+        would_exceed_rows = len(candidate) > MAX_SLACK_TABLE_ROWS
+        would_exceed_chunk_rows = len(current) >= SLACK_TABLE_DATA_ROWS_PER_MESSAGE
+        would_exceed_chars = slack_table_rows_text_length(candidate) > MAX_SLACK_TABLE_CHARS
+        if current and (would_exceed_rows or would_exceed_chunk_rows or would_exceed_chars):
+            chunks.append(current)
+            current = []
+        current.append(row)
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def slack_runner_table_block(rows: list[list[dict[str, Any]]]) -> dict[str, Any]:
+    return {
+        "type": "table",
+        "column_settings": [
+            {"is_wrapped": False},
+            {"is_wrapped": False},
+            {"is_wrapped": False},
+            {"align": "center"},
+            {"align": "center"},
+            {"align": "center"},
+            {"align": "center"},
+            {"align": "center"},
+            {"is_wrapped": True},
+            {"is_wrapped": True},
+        ],
+        "rows": [slack_runner_table_header(), *rows],
+    }
+
+
+def format_signature_flags_for_slack(result: JobScanResult) -> str:
+    parts = [
+        f"log:`{'Y' if result.log_checked else 'N'}`",
+        f"tlb:`{compact_signature_cell(result, 'TLB error') or '-'}`",
+        f"missing-dev:`{compact_signature_cell(result, 'Missing devices') or '-'}`",
+        (
+            "fabric:"
+            f"`{compact_signature_cell(result, 'Fabric link down (MGD topology)') or '-'}`"
+        ),
+        f"disk:`{compact_signature_cell(result, 'Out of disk') or '-'}`",
+    ]
+    if result.fabric_missing_links:
+        parts.append(f"links:`{slack_escape(result.fabric_missing_links)}`")
+    return " ".join(parts)
+
+
+def format_runner_log_table_for_slack(
+    runner: str, results: list[JobScanResult]
+) -> str:
+    lines = [
+        f"Full log signature report for `{slack_escape(runner)}` "
+        "Configured workflows only. To pin down runner failures, run the scanner locally.",
+        "Flags use `Y`/`N`; `-` means the log was not checked.",
+    ]
+    for result in results:
+        job = result.job
+        status = job.conclusion or job.status or "unknown"
+        started_at = job.started_at or "unknown start"
+        job_label = job.job_id or "unknown-job"
+        lines.append(
+            "* "
+            f"{slack_link(job.html_url, job_label)} "
+            f"`{slack_escape(status)}` "
+            f"`{slack_escape(started_at)}` "
+            f"{format_signature_flags_for_slack(result)} "
+            f"{slack_escape(job.workflow)} / {slack_escape(job.name)}"
+        )
+    return truncate_for_slack("\n".join(lines))
+
+
+def post_runner_log_table_for_slack(
+    slack_config: SlackConfig,
+    *,
+    runner: str,
+    results: list[JobScanResult],
+    thread_ts: str,
+) -> None:
+    heading = (
+        f"Full log signature table for `{slack_escape(runner)}`: "
+        f"{len(results)} recent configured-workflow job(s) found for this runner. "
+        "Flags use Y/N; '-' means no signature value."
+    )
+    post_slack_message(slack_config, heading, thread_ts=thread_ts)
+
+    table_rows = [slack_runner_table_row(result) for result in results]
+    if not table_rows:
+        return
+
+    chunks = chunk_slack_table_rows(table_rows)
+    row_offset = 0
+    for chunk in chunks:
+        start_row = row_offset + 1
+        end_row = start_row + len(chunk) - 1
+        row_offset += len(chunk)
+        fallback_text = (
+            f"Runner log signature table for {runner}, "
+            f"rows {start_row}-{end_row} of {len(table_rows)}."
+        )
+        try:
+            post_slack_message(
+                slack_config,
+                fallback_text,
+                thread_ts=thread_ts,
+                blocks=[slack_runner_table_block(chunk)],
+            )
+        except RuntimeError as exc:
+            if "invalid_blocks" not in str(exc):
+                raise
+            post_slack_message(
+                slack_config,
+                format_runner_log_table_for_slack(runner, results),
+                thread_ts=thread_ts,
+            )
+            return
+
+
+def post_runner_report_from_report(
+    slack_config: SlackConfig, report: dict[str, Any]
+) -> None:
+    runner_name = str(report.get("runner_name") or UNKNOWN_RUNNER)
+    scan_results = scan_results_from_report(report)
+    hours = int_from_report(report.get("hours"), default=24)
+    failures = [result for result in scan_results if result.signature_labels]
+
+    if failures:
+        parent_text = (
+            f"Detected runner failure on `{slack_escape(runner_name)}`: "
+            f"in the last {hours}h {slack_escape(format_signature_summary(failures))}. "
+            "Details in thread \U0001F9F5"
+        )
+    else:
+        parent_text = (
+            f"Runner report for `{slack_escape(runner_name)}`: "
+            f"no known runner-failure signatures found in the last {hours}h. "
+            "Details in thread \U0001F9F5"
+        )
+
+    thread_ts = post_slack_message(slack_config, parent_text)
+    post_runner_log_table_for_slack(
+        slack_config,
+        runner=runner_name,
+        results=scan_results,
+        thread_ts=thread_ts,
+    )
+    print(f"Posted Slack runner report for {runner_name}.")
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        slack_config = slack_config_from_channel(args.slack_channel)
+        if slack_config is None:
+            return 0
+        report = load_report_json(args.runner_report_json)
+        post_runner_report_from_report(slack_config, report)
+        return 0
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
