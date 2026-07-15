@@ -461,17 +461,125 @@ def test_ternary_addcmul_cache_hit_refreshes_operand_addresses(device):
     def reference(i):
         return base_t + base_t * chunks_t[..., i * H : (i + 1) * H]
 
-    # First call compiles the addcmul program.
-    out0 = ttnn.to_torch(ttnn.addcmul(base, base, chunk[0], value=1.0)).float()
-    entries_after_first = device.num_program_cache_entries()
-    assert_with_pcc(reference(0), out0, 0.99)
+    # Pre-allocate BOTH outputs and keep them alive across both calls, passing each via
+    # output_tensor. This forces the two dispatches to write to DISTINCT, simultaneously-live output
+    # buffers, so the second call's writer slot 0 must be re-patched to out1's address -- otherwise it
+    # writes into out0 and out1 stays zero. Without two live outputs the allocator could hand the
+    # second call out0's just-freed address, masking a missing writer-address patch.
+    out0 = ttnn.from_torch(
+        torch.zeros((1, 1, N, H), dtype=torch.bfloat16), device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+    )
+    out1 = ttnn.from_torch(
+        torch.zeros((1, 1, N, H), dtype=torch.bfloat16), device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+    )
 
-    # Cache hit with a different-buffer operand of identical shape: the addcmul program must be
-    # reused (no new cache entry), yet the stale-address regression made this return ~0 PCC.
-    out2 = ttnn.to_torch(ttnn.addcmul(base, base, chunk[2], value=1.0)).float()
+    # First call compiles the addcmul program.
+    ttnn.addcmul(base, base, chunk[0], value=1.0, output_tensor=out0)
+    entries_after_first = device.num_program_cache_entries()
+
+    # Cache hit with a different-buffer operand AND a different output buffer of identical shape: the
+    # addcmul program must be reused (no new cache entry), yet the stale-address regression made this
+    # return ~0 PCC.
+    ttnn.addcmul(base, base, chunk[2], value=1.0, output_tensor=out1)
     assert (
         device.num_program_cache_entries() == entries_after_first
     ), "same-shaped addcmul must reuse the cached program (no new cache entry)"
-    assert_with_pcc(reference(2), out2, 0.99)
+
+    assert_with_pcc(reference(0), ttnn.to_torch(out0).float(), 0.99)
+    assert_with_pcc(reference(2), ttnn.to_torch(out1).float(), 0.99)
+
+    device.disable_and_clear_program_cache()
+
+
+def test_ternary_where_tts_cache_hit_refreshes_operand_addresses(device):
+    """Cache-hit address re-patch for the where TTS variant (true = tensor, false = scalar).
+
+    TTS places the true tensor (input_b) at reader slot 1. This mirrors the addcmul (TTT) regression
+    for the tensor/tensor/scalar path: the second same-shape call's true-tensor operand lives in a
+    different buffer (a distinct ttnn.chunk slice) and writes a distinct live output, so reader slot 1
+    and writer slot 0 must be re-patched on the cache hit -- otherwise silent stale-buffer results.
+    """
+    device.enable_program_cache()
+    device.clear_program_cache()
+
+    torch.manual_seed(0)
+    N, H = 32, 64
+    false_scalar = 3.5
+
+    pred_t = torch.randint(0, 2, (1, 1, N, H)).to(torch.float32)
+    trues_t = torch.randn((1, 1, N, 4 * H), dtype=torch.float32)
+
+    pred = ttnn.from_torch(pred_t, device=device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    trues = ttnn.from_torch(trues_t, device=device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    true_chunk = ttnn.chunk(trues, 4, -1)  # 4 shape-identical operands in different buffers
+
+    def reference(i):
+        t = trues_t[..., i * H : (i + 1) * H]
+        return torch.where(pred_t.bool(), t, torch.tensor(false_scalar, dtype=torch.float32))
+
+    out0 = ttnn.from_torch(
+        torch.zeros((1, 1, N, H), dtype=torch.float32), device=device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT
+    )
+    out1 = ttnn.from_torch(
+        torch.zeros((1, 1, N, H), dtype=torch.float32), device=device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT
+    )
+
+    ttnn.where(pred, true_chunk[0], false_scalar, output_tensor=out0)
+    entries_after_first = device.num_program_cache_entries()
+
+    ttnn.where(pred, true_chunk[2], false_scalar, output_tensor=out1)
+    assert (
+        device.num_program_cache_entries() == entries_after_first
+    ), "same-shaped where(TTS) must reuse the cached program (no new cache entry)"
+
+    assert_with_pcc(reference(0), ttnn.to_torch(out0).float(), 0.99)
+    assert_with_pcc(reference(2), ttnn.to_torch(out1).float(), 0.99)
+
+    device.disable_and_clear_program_cache()
+
+
+def test_ternary_where_tst_cache_hit_refreshes_operand_addresses(device):
+    """Cache-hit address re-patch for the where TST variant (true = scalar, false = tensor).
+
+    TST places its lone tensor operand -- the false tensor (input_c) -- at reader slot 1, a different
+    optional field than TTS. The second same-shape call's false-tensor operand lives in a different
+    buffer (a distinct ttnn.chunk slice) and writes a distinct live output, so reader slot 1 and
+    writer slot 0 must be re-patched on the cache hit -- otherwise silent stale-buffer results.
+    """
+    device.enable_program_cache()
+    device.clear_program_cache()
+
+    torch.manual_seed(0)
+    N, H = 32, 64
+    true_scalar = 2.0
+
+    pred_t = torch.randint(0, 2, (1, 1, N, H)).to(torch.float32)
+    falses_t = torch.randn((1, 1, N, 4 * H), dtype=torch.float32)
+
+    pred = ttnn.from_torch(pred_t, device=device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    falses = ttnn.from_torch(falses_t, device=device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    false_chunk = ttnn.chunk(falses, 4, -1)  # 4 shape-identical operands in different buffers
+
+    def reference(i):
+        f = falses_t[..., i * H : (i + 1) * H]
+        return torch.where(pred_t.bool(), torch.tensor(true_scalar, dtype=torch.float32), f)
+
+    out0 = ttnn.from_torch(
+        torch.zeros((1, 1, N, H), dtype=torch.float32), device=device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT
+    )
+    out1 = ttnn.from_torch(
+        torch.zeros((1, 1, N, H), dtype=torch.float32), device=device, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT
+    )
+
+    ttnn.where(pred, true_scalar, false_chunk[0], output_tensor=out0)
+    entries_after_first = device.num_program_cache_entries()
+
+    ttnn.where(pred, true_scalar, false_chunk[2], output_tensor=out1)
+    assert (
+        device.num_program_cache_entries() == entries_after_first
+    ), "same-shaped where(TST) must reuse the cached program (no new cache entry)"
+
+    assert_with_pcc(reference(0), ttnn.to_torch(out0).float(), 0.99)
+    assert_with_pcc(reference(2), ttnn.to_torch(out1).float(), 0.99)
 
     device.disable_and_clear_program_cache()

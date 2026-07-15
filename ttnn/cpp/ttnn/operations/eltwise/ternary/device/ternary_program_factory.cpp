@@ -1443,10 +1443,12 @@ std::vector<tt::tt_metal::DynamicRuntimeArg> TernaryDeviceOperation::get_dynamic
         reader_slot_addrs.emplace_back(1, tensor_args.input_tensor_c->buffer()->address());
     }
 
+    // Each work core emits one entry per reader slot plus the writer-output and compute-scalar
+    // entries; noop cores emit none. Reserve the upper bound (treat every core as a work core).
+    const size_t per_core_args = reader_slot_addrs.size() + 2;  // + writer slot 0 + compute scalar
     std::vector<tt::tt_metal::DynamicRuntimeArg> dynamic_args;
-    dynamic_args.reserve(partition.cores.size() * 4);
-    for (uint32_t i = 0; i < partition.num_cores_total; ++i) {
-        const auto& core = partition.cores[i];
+    dynamic_args.reserve(partition.cores.size() * per_core_args);
+    for (const auto& core : partition.cores) {
         const bool is_work_core = partition.core_group_1.contains(core) || partition.core_group_2.contains(core);
         if (!is_work_core) {
             continue;  // noop core: compute arg[3] stays 0, mirrors create_descriptor()
