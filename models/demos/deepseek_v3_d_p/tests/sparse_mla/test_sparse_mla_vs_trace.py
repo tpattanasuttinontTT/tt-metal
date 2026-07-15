@@ -307,7 +307,15 @@ def _make_mla(model, config, layer, mesh_device, is_chunked=False):
     config.max_seq_len = SEQ_LEN  # rope-table length (same hack as v3 run_model / test_mla)
     weights = _weights_for(model, config, layer)  # canonical dict — same tensors the CPU truth uses
     return ttMLA(
-        config, weights, mesh_device, layer_idx=0, seq_len=SEQ_LEN, sp_axis=0, tp_axis=1, is_chunked=is_chunked
+        config,
+        weights,
+        mesh_device,
+        layer_idx=0,
+        seq_len=SEQ_LEN,
+        sp_axis=0,
+        tp_axis=1,
+        is_chunked=is_chunked,
+        layer_num=1,
     )
 
 
