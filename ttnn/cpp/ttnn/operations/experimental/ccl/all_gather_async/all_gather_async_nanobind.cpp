@@ -97,8 +97,13 @@ ttnn::Tensor all_gather_async_wrapper_persistent_buffer(
     std::optional<uint32_t> chunks_per_sync,
     std::optional<uint32_t> num_workers_per_link,
     std::optional<uint32_t> num_buffers_per_channel,
-    const std::optional<CoreRangeSet>& sub_core_grids) {
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    std::optional<uint32_t> batch_slice_idx = std::nullopt,
+    std::optional<uint32_t> valid_gather_extent = std::nullopt) {
     if constexpr (Reversed) {
+        TT_FATAL(
+            !batch_slice_idx.has_value() && !valid_gather_extent.has_value(),
+            "batch_slice_idx / valid_gather_extent are not supported on all_gather_async_reversed");
         return ttnn::experimental::all_gather_async_reversed(
             input_tensor,
             persistent_output_buffer,
@@ -135,7 +140,9 @@ ttnn::Tensor all_gather_async_wrapper_persistent_buffer(
             num_workers_per_link,
             num_buffers_per_channel,
             false,
-            sub_core_grids);
+            sub_core_grids,
+            batch_slice_idx,
+            valid_gather_extent);
     }
 }
 
@@ -277,7 +284,9 @@ void bind_all_gather_async(nb::module_& mod) {
             nb::arg("chunks_per_sync") = nb::none(),
             nb::arg("num_workers_per_link") = nb::none(),
             nb::arg("num_buffers_per_channel") = nb::none(),
-            nb::arg("sub_core_grids") = std::nullopt),
+            nb::arg("sub_core_grids") = std::nullopt,
+            nb::arg("batch_slice_idx") = nb::none(),
+            nb::arg("valid_gather_extent") = nb::none()),
         ttnn::overload_t(
             &all_gather_async_wrapper_mesh_device<false>,
             nb::arg("input_tensor"),
@@ -359,7 +368,9 @@ void bind_all_gather_async(nb::module_& mod) {
             nb::arg("chunks_per_sync") = nb::none(),
             nb::arg("num_workers_per_link") = nb::none(),
             nb::arg("num_buffers_per_channel") = nb::none(),
-            nb::arg("sub_core_grids") = std::nullopt),
+            nb::arg("sub_core_grids") = std::nullopt,
+            nb::arg("batch_slice_idx") = nb::none(),
+            nb::arg("valid_gather_extent") = nb::none()),
         ttnn::overload_t(
             &all_gather_async_wrapper_mesh_device<true>,
             nb::arg("input_tensor"),

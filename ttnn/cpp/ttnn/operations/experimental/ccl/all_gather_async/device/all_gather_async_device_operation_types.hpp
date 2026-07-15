@@ -38,6 +38,11 @@ struct AllGatherAsyncParams {
     std::optional<uint32_t> num_buffers_per_channel;
     bool reverse_order = false;
     std::optional<CoreRangeSet> sub_core_grid;
+    // Gather only a single index along dim 0 (gather dim must be != 0); output dim-0 collapses to 1.
+    std::optional<uint32_t> batch_slice_idx;
+    // Gather only the valid prefix (elements, tile-aligned) along the height (rank-2) gather dim of an
+    // overallocated input; limits data movement without shrinking the output.
+    std::optional<uint32_t> valid_gather_extent;
 
     AllGatherAsyncParams(
         int32_t dim,
@@ -57,7 +62,9 @@ struct AllGatherAsyncParams {
         std::optional<uint32_t> num_workers_per_link,
         std::optional<uint32_t> num_buffers_per_channel,
         bool reverse_order,
-        const std::optional<CoreRangeSet>& sub_core_grid) :
+        const std::optional<CoreRangeSet>& sub_core_grid,
+        std::optional<uint32_t> batch_slice_idx = std::nullopt,
+        std::optional<uint32_t> valid_gather_extent = std::nullopt) :
         dim(dim),
         num_links(num_links),
         ring_size(ring_size),
@@ -75,7 +82,9 @@ struct AllGatherAsyncParams {
         num_workers_per_link(num_workers_per_link),
         num_buffers_per_channel(num_buffers_per_channel),
         reverse_order(reverse_order),
-        sub_core_grid(sub_core_grid) {}
+        sub_core_grid(sub_core_grid),
+        batch_slice_idx(batch_slice_idx),
+        valid_gather_extent(valid_gather_extent) {}
 
     static constexpr auto attribute_names = std::forward_as_tuple(
         "dim",
@@ -94,7 +103,11 @@ struct AllGatherAsyncParams {
         "num_workers_per_link",
         "num_buffers_per_channel",
         "reverse_order",
-        "sub_core_grid");
+        "sub_core_grid",
+        // Only whether batch_slice_idx is engaged affects the compiled program (CT arg + output shape).
+        // The index value and valid_gather_extent flow through re-patched runtime args, so they are
+        // deliberately excluded from the cache key -> value-only changes reuse the cached program.
+        "batch_slice_present");
     auto attribute_values() const {
         return std::make_tuple(
             dim,
@@ -113,7 +126,8 @@ struct AllGatherAsyncParams {
             num_workers_per_link,
             num_buffers_per_channel,
             reverse_order,
-            sub_core_grid);
+            sub_core_grid,
+            batch_slice_idx.has_value());
     }
 };
 

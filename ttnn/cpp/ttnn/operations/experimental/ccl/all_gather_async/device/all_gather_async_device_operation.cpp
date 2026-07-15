@@ -92,6 +92,37 @@ void AllGatherAsyncDeviceOperation::validate_on_program_cache_miss(
 
     TT_FATAL(input_tensor.storage_type() == StorageType::DEVICE, "Operands to all_gather need to be on device!");
     TT_FATAL(input_tensor.buffer() != nullptr, "Operands to all_gather need to be allocated in buffers on device!");
+
+    // The single-batch-slice / partial-gather features are only wired on the MINIMAL_DEFAULT program
+    // (the shared minimal_default reader/writer). Reject them on the llama-sharded / via-broadcast paths.
+    if (args.batch_slice_idx.has_value() || args.valid_gather_extent.has_value()) {
+        TT_FATAL(
+            select_version(args) == AllGatherAsyncVersion::MINIMAL_DEFAULT,
+            "batch_slice_idx / valid_gather_extent are only supported on the minimal-default all_gather_async path "
+            "(not the llama-sharded or via-broadcast variants)");
+    }
+    if (args.batch_slice_idx.has_value()) {
+        const auto& s = input_tensor.logical_shape();
+        TT_FATAL(args.dim != 0, "batch_slice_idx is not supported when gathering along dim 0");
+        TT_FATAL(
+            args.batch_slice_idx.value() < static_cast<uint32_t>(s[0]),
+            "batch_slice_idx {} is out of range for dim-0 extent {}",
+            args.batch_slice_idx.value(),
+            s[0]);
+    }
+    if (args.valid_gather_extent.has_value()) {
+        const auto rank = input_tensor.logical_shape().rank();
+        TT_FATAL(
+            args.dim == rank - 2,
+            "valid_gather_extent is only supported when gathering along the height dim (rank-2), got dim {} of rank {}",
+            args.dim,
+            rank);
+        TT_FATAL(
+            args.valid_gather_extent.value() % 32 == 0,
+            "valid_gather_extent {} must be tile-aligned (a multiple of 32)",
+            args.valid_gather_extent.value());
+    }
+
     TT_FATAL(args.num_links > 0, "Error, num_links should be more than 0 but has {}", args.num_links);
     TT_FATAL(
         args.num_links <= input_tensor.device()->compute_with_storage_grid_size().y,
@@ -209,6 +240,11 @@ AllGatherAsyncDeviceOperation::spec_return_value_t AllGatherAsyncDeviceOperation
     const auto& input_tensor = tensor_args.input_tensor;
     auto shape = input_tensor.logical_shape();
     shape[args.dim] *= args.ring_size;
+    // Single-batch slice: the gathered output holds only one batch (dim-0 == 1). valid_gather_extent does
+    // not change the output shape (each slab keeps the padded-input stride); it only limits data movement.
+    if (args.batch_slice_idx.has_value()) {
+        shape[0] = 1;
+    }
     return TensorSpec(
         shape,
         tt::tt_metal::TensorLayout(
@@ -267,7 +303,9 @@ std::tuple<AllGatherAsyncParams, AllGatherAsyncInputs> all_gather_async_build_op
     const std::optional<uint32_t>& num_buffers_per_channel,
     bool reverse_order,
     const std::optional<CoreRangeSet>& sub_core_grid,
-    const MeshDevice* optional_mesh_device) {
+    const MeshDevice* optional_mesh_device,
+    std::optional<uint32_t> batch_slice_idx,
+    std::optional<uint32_t> valid_gather_extent) {
     // Combine 3 implementations of the old all_gather_async_op.cpp::all_gather_async_impl
     // 1. only input_tensor, no output or optional mesh device
     // 2. has input tensor and output tensor but not optional mesh device
@@ -324,7 +362,9 @@ std::tuple<AllGatherAsyncParams, AllGatherAsyncInputs> all_gather_async_build_op
             num_workers_per_link,
             num_buffers_per_channel,
             reverse_order,
-            sub_core_grid),
+            sub_core_grid,
+            batch_slice_idx,
+            valid_gather_extent),
         AllGatherAsyncInputs{.input_tensor = input_tensor, .persistent_output_buffer = persistent_output_buffer}};
 }
 
@@ -467,7 +507,9 @@ Tensor all_gather_async(
     const std::optional<uint32_t>& num_buffers_per_channel,
     bool reverse_order,
     const std::optional<CoreRangeSet>& sub_core_grid,
-    const MeshDevice* optional_mesh_device) {
+    const MeshDevice* optional_mesh_device,
+    std::optional<uint32_t> batch_slice_idx,
+    std::optional<uint32_t> valid_gather_extent) {
     auto [params, inputs] = experimental::prim::all_gather_async_build_operation_args(
         input_tensor,
         persistent_output_buffer,
@@ -487,7 +529,9 @@ Tensor all_gather_async(
         num_buffers_per_channel,
         reverse_order,
         sub_core_grid,
-        optional_mesh_device);
+        optional_mesh_device,
+        batch_slice_idx,
+        valid_gather_extent);
     return ttnn::device_operation::launch<experimental::prim::AllGatherAsyncDeviceOperation>(params, inputs);
 }
 

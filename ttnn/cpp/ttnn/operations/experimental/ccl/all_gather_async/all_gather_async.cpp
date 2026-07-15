@@ -89,7 +89,9 @@ ttnn::Tensor all_gather_async(
     std::optional<uint32_t> num_workers_per_link,
     std::optional<uint32_t> num_buffers_per_channel,
     bool reverse_order,
-    const std::optional<CoreRangeSet>& sub_core_grid) {
+    const std::optional<CoreRangeSet>& sub_core_grid,
+    std::optional<uint32_t> batch_slice_idx,
+    std::optional<uint32_t> valid_gather_extent) {
     auto* mesh_device_ptr = input_tensor.device();
     TT_FATAL(mesh_device_ptr != nullptr, "Mesh device is required for all_gather_async operation");
     uint32_t resolved_num_links =
@@ -102,8 +104,18 @@ ttnn::Tensor all_gather_async(
     if (composite_all_gather_case && !all_gather_async_llama_sharded_case) {
         log_debug(tt::LogOp, "Using composite_all_gather");
         TT_FATAL(!sub_core_grid.has_value(), "Composite All Gather OP does not currently support sub core grid");
+        // The composite (broadcast) path folds both the single-batch slot select and the valid-prefix
+        // clamp into a slice before the broadcast; valid_gather_extent yields a tight gathered output.
         return composite_common::composite_all_gather(
-            input_tensor, dim, resolved_num_links, memory_config, subdevice_id, cluster_axis);
+            input_tensor,
+            dim,
+            resolved_num_links,
+            memory_config,
+            subdevice_id,
+            cluster_axis,
+            /*use_l1_small_for_semaphores*/ false,
+            batch_slice_idx,
+            valid_gather_extent);
     }
     log_debug(tt::LogOp, "Using minimal_all_gather_async");
     return ttnn::prim::all_gather_async(
@@ -125,7 +137,9 @@ ttnn::Tensor all_gather_async(
         num_buffers_per_channel,
         reverse_order,
         sub_core_grid,
-        /*mesh_device*/ nullptr);
+        /*mesh_device*/ nullptr,
+        batch_slice_idx,
+        valid_gather_extent);
 }
 
 // Overload with multi-device input
