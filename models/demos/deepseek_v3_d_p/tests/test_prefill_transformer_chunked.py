@@ -100,6 +100,11 @@ LAYER_PCC_THRESHOLD = 0.88
 # Deepest config whose per-layer PCC is asserted; deeper runs (L61) stay record-only until their
 # accumulation headroom is pinned.
 GATED_LAYER_DEPTH = 10
+# Record-only warn floors for the deep KV / indexer-K cache PCC: a WARNING, never a test stop. Each sits
+# below the observed glm_5_2 L78 min with headroom, since later data may drop further (KVPE nope bottoms
+# ~0.863 @L75; indexer-K ~0.980 @L62). Retune down if real data drops, up if it hides a regression.
+KV_CACHE_PCC_WARN_THRESHOLD = 0.84
+INDEXER_K_PCC_WARN_THRESHOLD = 0.95
 
 # Per-chunk baseline medians (seconds) for the no-PCC perf gate, pulled from a known-good CI run. Keyed
 # by (num_layers, n_chunks, num_iters) so only the exact config we have a CI number for is gated; every
@@ -200,7 +205,15 @@ def _record_kv_cache_pcc(
         _, pcc_pe = comp_pcc(ref_pe_int, dev_cache[:, kv_lora:])
         cache_min_pcc[i] = min(pcc_nope, pcc_pe)
         logger.info(f"  cache layer {i} PCC: nope={pcc_nope:.6f} pe(interleaved)={pcc_pe:.6f}")
-    logger.info(f"KV cache min PCC across layers: {min(cache_min_pcc.values()):.6f}")
+        if cache_min_pcc[i] < KV_CACHE_PCC_WARN_THRESHOLD:
+            logger.warning(
+                f"  KV cache layer {i} PCC {cache_min_pcc[i]:.6f} below warn floor "
+                f"{KV_CACHE_PCC_WARN_THRESHOLD} (record-only, not asserted)"
+            )
+    kv_min = min(cache_min_pcc.values())
+    logger.info(f"KV cache min PCC across layers: {kv_min:.6f}")
+    if kv_min < KV_CACHE_PCC_WARN_THRESHOLD:
+        logger.warning(f"KV cache min PCC {kv_min:.6f} below warn floor {KV_CACHE_PCC_WARN_THRESHOLD} (record-only)")
 
 
 def _record_indexer_k_cache_pcc(
@@ -237,7 +250,17 @@ def _record_indexer_k_cache_pcc(
         _, pcc_rope = comp_pcc(g[:, :rope], dev_cache[:, :rope])
         idx_min_pcc[i] = min(pcc_nope, pcc_rope)
         logger.info(f"  indexer cache layer {i} PCC: nope={pcc_nope:.6f} rope={pcc_rope:.6f}")
-    logger.info(f"Indexer-K cache min PCC across {len(layers)} captured layers: {min(idx_min_pcc.values()):.6f}")
+        if idx_min_pcc[i] < INDEXER_K_PCC_WARN_THRESHOLD:
+            logger.warning(
+                f"  indexer-K cache layer {i} PCC {idx_min_pcc[i]:.6f} below warn floor "
+                f"{INDEXER_K_PCC_WARN_THRESHOLD} (record-only, not asserted)"
+            )
+    idx_min = min(idx_min_pcc.values())
+    logger.info(f"Indexer-K cache min PCC across {len(layers)} captured layers: {idx_min:.6f}")
+    if idx_min < INDEXER_K_PCC_WARN_THRESHOLD:
+        logger.warning(
+            f"Indexer-K cache min PCC {idx_min:.6f} below warn floor {INDEXER_K_PCC_WARN_THRESHOLD} (record-only)"
+        )
 
 
 def run_chunked_transformer_padded(
