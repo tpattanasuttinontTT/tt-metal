@@ -101,10 +101,11 @@ LAYER_PCC_THRESHOLD = 0.88
 # accumulation headroom is pinned.
 GATED_LAYER_DEPTH = 10
 # Record-only warn floors for the deep KV / indexer-K cache PCC: a WARNING, never a test stop. Each sits
-# below the observed glm_5_2 L78 min with headroom, since later data may drop further (KVPE nope bottoms
-# ~0.863 @L75; indexer-K ~0.980 @L62). Retune down if real data drops, up if it hides a regression.
+# below the observed L78 min with headroom, since later data may drop further. KVPE nope bottoms ~0.863
+# (glm_5_2 @L75); indexer-K nope ~0.952 (glm_5_1 @L52 -- glm_5_1 captures all 78 layers, so glm_5_2's 21-
+# layer subsample (0-2 + every 4th) understates the true worst at 0.980). Retune down if real data drops.
 KV_CACHE_PCC_WARN_THRESHOLD = 0.84
-INDEXER_K_PCC_WARN_THRESHOLD = 0.95
+INDEXER_K_PCC_WARN_THRESHOLD = 0.93
 
 # Per-chunk baseline medians (seconds) for the no-PCC perf gate, pulled from a known-good CI run. Keyed
 # by (num_layers, n_chunks, num_iters) so only the exact config we have a CI number for is gated; every
