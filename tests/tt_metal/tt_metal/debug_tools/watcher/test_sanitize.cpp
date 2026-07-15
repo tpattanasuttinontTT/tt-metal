@@ -122,6 +122,12 @@ void RunTestOnCore(
     if (multi_dm_race && !is_quasar) {
         GTEST_SKIP() << "Multi-DM race test only runs on Quasar";
     }
+    // The Quasar NOC shifts the data so transfers don't need to be aligned; a misaligned transfer is
+    // legal there and there is nothing to flag. These tests stay valid on WH/BH where alignment is
+    // enforced.
+    if ((feature == SanitizeNOCAlignmentL1Write || feature == SanitizeNOCAlignmentL1Read) && is_quasar) {
+        GTEST_SKIP() << "Quasar NOC has no L1/DRAM alignment restriction; misaligned transfers are legal";
+    }
     // Both exercise Quasar's uncached L1 alias, which only exists on Quasar DM cores.
     if ((feature == SanitizeNOCMailboxWriteUncachedAlias || feature == SanitizeL1OverflowStraddle) &&
         (!is_quasar || is_eth_core)) {
