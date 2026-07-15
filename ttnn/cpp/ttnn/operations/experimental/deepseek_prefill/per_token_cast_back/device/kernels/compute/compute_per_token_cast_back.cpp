@@ -27,7 +27,6 @@
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/bcast.h"
 #include "api/dataflow/circular_buffer.h"
-#include "tools/profiler/kernel_profiler.hpp"
 
 void kernel_main() {
     constexpr uint32_t cb_input_e4m3_id = get_compile_time_arg_val(0);
@@ -110,27 +109,24 @@ void kernel_main() {
             // untilizes them to the row-major output in the packer. This removes the separate cb_out_tile
             // round-trip and the standalone untilize datacopy pass. In 32-bit DEST (fp32_dest_acc), the
             // half-sync pack-untilize block cap is 4 tiles, which is exactly one 128-wide block.
-            {
-                DeviceZoneScopedN("matmul");
-                reconfig_data_format(cb_in_tile_id, cb_scale_bcast_id);
-                mul_bcast_cols_init_short(cb_in_tile_id, cb_scale_bcast_id);
-                pack_untilize_dest_init<tiles_per_block, tiles_per_block>(cb_out_fp32_id);
-                cb_in_tile.wait_front(tiles_per_block);
-                cb_scale_bcast.wait_front(block_ht);
-                cb_out_fp32.reserve_back(tiles_per_block);
-                tile_regs_acquire();
-                for (uint32_t k = 0; k < block_wt; ++k) {
-                    mul_tiles_bcast_cols(cb_in_tile_id, cb_scale_bcast_id, k, 0, k);
-                }
-                tile_regs_commit();
-                tile_regs_wait();
-                pack_untilize_dest<tiles_per_block>(cb_out_fp32_id);
-                tile_regs_release();
-                cb_out_fp32.push_back(tiles_per_block);
-                cb_in_tile.pop_front(tiles_per_block);
-                cb_scale_bcast.pop_front(block_ht);
-                pack_untilize_uninit(cb_out_fp32_id);
+            reconfig_data_format(cb_in_tile_id, cb_scale_bcast_id);
+            mul_bcast_cols_init_short(cb_in_tile_id, cb_scale_bcast_id);
+            pack_untilize_dest_init<tiles_per_block, tiles_per_block>(cb_out_fp32_id);
+            cb_in_tile.wait_front(tiles_per_block);
+            cb_scale_bcast.wait_front(block_ht);
+            cb_out_fp32.reserve_back(tiles_per_block);
+            tile_regs_acquire();
+            for (uint32_t k = 0; k < block_wt; ++k) {
+                mul_tiles_bcast_cols(cb_in_tile_id, cb_scale_bcast_id, k, 0, k);
             }
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_untilize_dest<tiles_per_block>(cb_out_fp32_id);
+            tile_regs_release();
+            cb_out_fp32.push_back(tiles_per_block);
+            cb_in_tile.pop_front(tiles_per_block);
+            cb_scale_bcast.pop_front(block_ht);
+            pack_untilize_uninit(cb_out_fp32_id);
         }
     }
 }
