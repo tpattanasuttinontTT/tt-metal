@@ -23,6 +23,7 @@
 #include "llk_sfpu/ckernel_sfpu_addcmul.h"
 #include "llk_sfpu/ckernel_sfpu_binary.h"
 #include "llk_sfpu/ckernel_sfpu_binary_comp.h"
+#include "llk_sfpu/ckernel_sfpu_binary_max_min.h"
 // This header expects a DST_ACCUM_MODE macro; scope it to the include so it
 // doesn't clash with the DST_ACCUM_MODE template param used below.
 #define DST_ACCUM_MODE 0
@@ -55,6 +56,7 @@
 #include "llk_sfpu/ckernel_sfpu_tanhshrink.h"
 #include "llk_sfpu/ckernel_sfpu_trigonometry.h"
 #include "llk_sfpu/ckernel_sfpu_typecast.h"
+#include "llk_sfpu/ckernel_sfpu_unary_max_min.h"
 #include "sfpu/ckernel_sfpu_abs.h"
 #include "sfpu/ckernel_sfpu_add_int.h"
 #include "sfpu/ckernel_sfpu_clamp.h"
@@ -439,6 +441,14 @@ void call_unary_sfpu_operation_init()
         // Typecast selects its concrete init from the (IN, OUT) format pair.
         call_unary_typecast_operation_init<TYPECAST_IN, TYPECAST_OUT, APPROX_MODE>();
     }
+    else if constexpr (OPERATION == SfpuType::unary_max)
+    {
+        llk_math_eltwise_unary_sfpu_init<OPERATION>(sfpu::unary_max_min_init<true /* IS_MAX */>);
+    }
+    else if constexpr (OPERATION == SfpuType::unary_min)
+    {
+        llk_math_eltwise_unary_sfpu_init<OPERATION>(sfpu::unary_max_min_init<false /* IS_MAX */>);
+    }
     else
     {
         llk_math_eltwise_unary_sfpu_init<OPERATION>();
@@ -755,6 +765,29 @@ void call_unary_sfpu_operation(std::uint32_t dst_index, std::uint32_t math_forma
             3 /* logk */,
             0 /* skip_second */);
     }
+    else if constexpr (OPERATION == SfpuType::unary_max)
+    {
+        // Scalar operand baked in as fp32 bits (5.0f). Golden mirrors this with threshold=5.
+        SFPU_UNARY_CALL(
+            DST_SYNC_MODE,
+            DST_ACCUM_MODE,
+            calculate_unary_max_min,
+            (true /* IS_MAX */, APPROX_MODE, ITERATIONS),
+            dst_index,
+            vector_mode,
+            0x40a00000u /* 5.0f */);
+    }
+    else if constexpr (OPERATION == SfpuType::unary_min)
+    {
+        SFPU_UNARY_CALL(
+            DST_SYNC_MODE,
+            DST_ACCUM_MODE,
+            calculate_unary_max_min,
+            (false /* IS_MAX */, APPROX_MODE, ITERATIONS),
+            dst_index,
+            vector_mode,
+            0x40a00000u /* 5.0f */);
+    }
     else if constexpr (OPERATION == SfpuType::relu_max)
     {
         SFPU_UNARY_CALL(
@@ -906,6 +939,28 @@ void call_binary_sfpu_operation_init()
     else if constexpr (BINOP == BinaryOp::ADD_TOP_ROW)
     {
         SFPU_BINARY_INIT_FN_NO_ARGS(add1, init_add_top_row);
+    }
+    else if constexpr (BINOP == BinaryOp::MAX || BINOP == BinaryOp::MIN)
+    {
+        // Elementwise max/min. There is no dedicated SfpuType, so reuse the
+        // baseline binary addrmod setup (SfpuType::add1) and program the op's
+        // SFPLOADMACRO templates via its own init callback. Under
+        // -DDISABLE_SFPLOADMACRO these inits compile to just the addrmod setup
+        // (the macro programming is #ifndef-guarded) and the sfpi compute path
+        // is exercised instead.
+        constexpr bool is_max = (BINOP == BinaryOp::MAX);
+        if constexpr (MATH_FORMAT == static_cast<std::uint32_t>(DataFormat::Int32))
+        {
+            SFPU_BINARY_INIT_FN(add1, binary_max_min_int32_init, (is_max, false /* IS_UNSIGNED */));
+        }
+        else if constexpr (MATH_FORMAT == static_cast<std::uint32_t>(DataFormat::UInt32))
+        {
+            SFPU_BINARY_INIT_FN(add1, binary_max_min_int32_init, (is_max, true /* IS_UNSIGNED */));
+        }
+        else
+        {
+            SFPU_BINARY_INIT_FN(add1, binary_max_min_init, (is_max));
+        }
     }
     else if constexpr (BINOP == BinaryOp::RSHFT || BINOP == BinaryOp::LOGICAL_RSHFT)
     {
@@ -1099,6 +1154,48 @@ void call_binary_sfpu_operation(
             dst_index_in1,
             dst_index_out,
             ckernel::VectorMode::RC_custom);
+    }
+    else if constexpr (BINOP == BinaryOp::MAX || BINOP == BinaryOp::MIN)
+    {
+        // Elementwise max/min. Float goes through calculate_binary_max_min; Int32
+        // (signed) and UInt32 (IS_UNSIGNED) go through calculate_binary_max_min_int32.
+        constexpr bool is_max = (BINOP == BinaryOp::MAX);
+        if constexpr (MATH_FORMAT == static_cast<std::uint32_t>(DataFormat::Int32))
+        {
+            SFPU_BINARY_CALL(
+                DST_SYNC_MODE,
+                DST_ACCUM_MODE,
+                calculate_binary_max_min_int32,
+                (is_max, false /* IS_UNSIGNED */, PER_FACE_ITERATIONS),
+                dst_index_in0,
+                dst_index_in1,
+                dst_index_out,
+                vector_mode);
+        }
+        else if constexpr (MATH_FORMAT == static_cast<std::uint32_t>(DataFormat::UInt32))
+        {
+            SFPU_BINARY_CALL(
+                DST_SYNC_MODE,
+                DST_ACCUM_MODE,
+                calculate_binary_max_min_int32,
+                (is_max, true /* IS_UNSIGNED */, PER_FACE_ITERATIONS),
+                dst_index_in0,
+                dst_index_in1,
+                dst_index_out,
+                vector_mode);
+        }
+        else
+        {
+            SFPU_BINARY_CALL(
+                DST_SYNC_MODE,
+                DST_ACCUM_MODE,
+                calculate_binary_max_min,
+                (is_max, PER_FACE_ITERATIONS),
+                dst_index_in0,
+                dst_index_in1,
+                dst_index_out,
+                vector_mode);
+        }
     }
     else if constexpr (
         BINOP == BinaryOp::LT || BINOP == BinaryOp::GT || BINOP == BinaryOp::LE || BINOP == BinaryOp::GE || BINOP == BinaryOp::EQ || BINOP == BinaryOp::NE)

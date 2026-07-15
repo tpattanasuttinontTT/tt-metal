@@ -135,6 +135,8 @@ class MathOperation(Enum):
     Threshold = OpSpec("threshold", MathOpType.SFPU_UNARY)
     ReluMax = OpSpec("relu_max", MathOpType.SFPU_UNARY)
     ReluMin = OpSpec("relu_min", MathOpType.SFPU_UNARY)
+    UnaryMax = OpSpec("unary_max", MathOpType.SFPU_UNARY)
+    UnaryMin = OpSpec("unary_min", MathOpType.SFPU_UNARY)
     Lrelu = OpSpec("lrelu", MathOpType.SFPU_UNARY)
     AddInt32 = OpSpec("add_int32", MathOpType.SFPU_UNARY)
     SubInt32 = OpSpec("sub_int32", MathOpType.SFPU_UNARY)
@@ -166,6 +168,12 @@ class MathOperation(Enum):
     SfpuElwGe = OpSpec("GE", MathOpType.SFPU_BINARY)
     SfpuElwEq = OpSpec("EQ", MathOpType.SFPU_BINARY)
     SfpuElwNe = OpSpec("NE", MathOpType.SFPU_BINARY)
+    # Elementwise max/min of two dest tiles (calculate_binary_max_min /
+    # calculate_binary_max_min_int32). Float uses the signed compare path; the
+    # Int32/UInt32 format selection (signed vs IS_UNSIGNED) is done in the C++
+    # dispatch (call_binary_sfpu_operation) via MATH_FORMAT.
+    SfpuElwMax = OpSpec("MAX", MathOpType.SFPU_BINARY)
+    SfpuElwMin = OpSpec("MIN", MathOpType.SFPU_BINARY)
 
     # =============================================================================
     # SFPU TERNARY OPERATIONS

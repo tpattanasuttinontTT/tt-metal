@@ -59,6 +59,9 @@ from helpers.utils import passed_test
         MathOperation.SfpuElwGe,
         MathOperation.SfpuElwEq,
         MathOperation.SfpuElwNe,
+        # Elementwise max/min (sfpi calculate_binary_max_min).
+        MathOperation.SfpuElwMax,
+        MathOperation.SfpuElwMin,
     ],
     dest_acc=[DestAccumulation.No, DestAccumulation.Yes],
 )
@@ -148,6 +151,9 @@ def test_sfpu_binary_div(formats, dest_acc):
         MathOperation.SfpuElwGt,
         MathOperation.SfpuElwLe,
         MathOperation.SfpuElwGe,
+        # Int32 signed max/min (sfpi calculate_binary_max_min_int32).
+        MathOperation.SfpuElwMax,
+        MathOperation.SfpuElwMin,
     ],
     dest_acc=[DestAccumulation.Yes],
 )
@@ -156,6 +162,35 @@ def test_sfpu_binary_int(
     dest_acc,
     mathop,
 ):
+    sfpu_binary(
+        formats,
+        dest_acc,
+        mathop,
+    )
+
+
+@parametrize(
+    formats=input_output_formats(
+        [
+            DataFormat.UInt32,
+        ],
+        same=True,
+    ),
+    mathop=[
+        MathOperation.SfpuElwMax,
+        MathOperation.SfpuElwMin,
+    ],
+    dest_acc=[DestAccumulation.Yes],
+)
+def test_sfpu_binary_uint_max_min(
+    formats,
+    dest_acc,
+    mathop,
+):
+    # Exercises the IS_UNSIGNED path of calculate_binary_max_min_int32. The
+    # default UInt32 stimuli are drawn from [0, 2^30) (MSB clear), which is the
+    # range Dest's sign-magnitude int32 storage can represent, so the sign-fold
+    # unsigned compare agrees with the golden here.
     sfpu_binary(
         formats,
         dest_acc,

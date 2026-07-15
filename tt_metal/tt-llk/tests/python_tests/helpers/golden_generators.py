@@ -2173,6 +2173,8 @@ class UnarySFPUGolden:
             MathOperation.Threshold: self._threshold,
             MathOperation.ReluMax: self._relu_max,
             MathOperation.ReluMin: self._relu_min,
+            MathOperation.UnaryMax: self._unary_max,
+            MathOperation.UnaryMin: self._unary_min,
             MathOperation.Lrelu: self._lrelu,
             MathOperation.ReduceColumn: self._reduce_columns,
             MathOperation.ReduceRow: self._reduce_rows,
@@ -2631,6 +2633,24 @@ class UnarySFPUGolden:
         )
         return torch.max(input_tensor, torch.tensor(threshold)).item()
 
+    def _unary_max(self, x, value=5):
+        # Matches calculate_unary_max_min<IS_MAX=true>: elementwise max(x, value).
+        input_tensor = (
+            x
+            if isinstance(x, torch.Tensor)
+            else torch.tensor(x, dtype=format_dict[self.data_format])
+        )
+        return torch.max(input_tensor, torch.tensor(value)).item()
+
+    def _unary_min(self, x, value=5):
+        # Matches calculate_unary_max_min<IS_MAX=false>: elementwise min(x, value).
+        input_tensor = (
+            x
+            if isinstance(x, torch.Tensor)
+            else torch.tensor(x, dtype=format_dict[self.data_format])
+        )
+        return torch.min(input_tensor, torch.tensor(value)).item()
+
     def _lrelu(self, x, negative_slope=0.1):
         input_tensor = (
             x
@@ -3014,6 +3034,8 @@ class BinarySFPUGolden(EltwiseBinaryGolden):
                 MathOperation.SfpuElwGe: self._ge,
                 MathOperation.SfpuElwEq: self._eq,
                 MathOperation.SfpuElwNe: self._ne,
+                MathOperation.SfpuElwMax: self._maximum,
+                MathOperation.SfpuElwMin: self._minimum,
             }
         )
 
@@ -3173,6 +3195,15 @@ class BinarySFPUGolden(EltwiseBinaryGolden):
 
     def _ne(self, t1, t2):
         return float(t1 != t2)
+
+    def _maximum(self, t1, t2):
+        # Elementwise max. For Int32/UInt32 the values are compared as-is; the
+        # test stimuli keep them within the sign-magnitude-representable range so
+        # signed and unsigned ordering agree with torch's comparison here.
+        return t1 if t1 >= t2 else t2
+
+    def _minimum(self, t1, t2):
+        return t1 if t1 <= t2 else t2
 
     def _add_top_row(
         self,

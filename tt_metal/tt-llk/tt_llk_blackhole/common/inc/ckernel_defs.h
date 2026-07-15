@@ -320,6 +320,8 @@ enum class BinaryOp : std::uint8_t
     GE            = 14,
     EQ            = 15,
     NE            = 16,
+    MAX           = 17,
+    MIN           = 18,
 };
 
 enum class PackMode : std::uint8_t

@@ -83,6 +83,8 @@ ALL_MATHOPS = [
     MathOperation.Threshold,
     MathOperation.ReluMax,
     MathOperation.ReluMin,
+    MathOperation.UnaryMax,
+    MathOperation.UnaryMin,
 ]
 
 FORMATS = input_output_formats(
@@ -193,6 +195,8 @@ def test_eltwise_unary_sfpu_float(
         MathOperation.Threshold,
         MathOperation.ReluMax,
         MathOperation.ReluMin,
+        MathOperation.UnaryMax,
+        MathOperation.UnaryMin,
         MathOperation.Tanh,
     ]:
         # SFPI Issue link: https://github.com/tenstorrent/tt-metal/issues/33268
