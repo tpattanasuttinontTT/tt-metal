@@ -1,0 +1,41 @@
+# One-off smoke test: files a Jira ticket from real CI to verify the
+# JIRA_RELEASE_* secrets resolve, the account authenticates, and it has
+# permission to create issues in the RELEASE project. Safe to delete once
+# verified. Runs whenever this file is pushed (path-scoped so ordinary commits
+# don't re-trigger it), or via manual dispatch once on the default branch.
+name: "[internal] Jira release smoke test"
+
+on:
+  push:
+    paths:
+      - ".github/workflows/jira-smoke-test.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  file-jira:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        timeout-minutes: 20
+
+      - name: File Jira smoke-test issue
+        env:
+          JIRA_BASE_URL: "https://tenstorrent.atlassian.net"
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_RELEASE_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_RELEASE_API_TOKEN }}
+          JIRA_PROJECT_KEY: "RELEASE"
+          JIRA_ISSUE_TYPE: "Bug"
+          JIRA_SUMMARY: "[smoke test] Jira release automation wiring check"
+          JIRA_DESCRIPTION: |
+            Connectivity smoke test from CI.
+            Commit: ${{ github.sha }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Distinct dedup label so re-runs comment on the same test issue and
+          # never collide with the production docs-release automation's issue.
+          JIRA_LABELS: "jira-automation-smoke-test"
+          JIRA_DEDUP_LABEL: "jira-automation-smoke-test"
+        run: python3 .github/actions/scripts/create_jira_issue.py

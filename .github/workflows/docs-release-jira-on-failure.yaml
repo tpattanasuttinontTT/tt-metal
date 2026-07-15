@@ -4,11 +4,14 @@
 # and opens (or de-duplicates onto) a Jira issue via create_jira_issue.py.
 #
 # TODO (specifics to be provided):
-#   - vars.JIRA_PROJECT_KEY  : the board/project to file under
 #   - JIRA_ISSUE_TYPE        : issue type (default below: Bug)
 #   - WATCH_JOBS             : comma-separated job-name substrings that count as
 #                             "the tests and pipelines" (empty = any failed job)
-#   - secrets JIRA_USER_EMAIL / JIRA_API_TOKEN : Jira service-account credentials
+#
+# Credentials (repo/org Actions secrets, scoped to this RELEASE-project automation
+# so other Jira projects can carry their own):
+#   - secrets JIRA_RELEASE_USER_EMAIL / JIRA_RELEASE_API_TOKEN : Jira account creds
+# The Jira project key ("RELEASE") is not secret and is inlined below.
 name: "[internal] File Jira issue on docs release failure"
 
 on:
@@ -87,9 +90,9 @@ jobs:
         if: ${{ steps.collect.outputs.file == 'true' }}
         env:
           JIRA_BASE_URL: "https://tenstorrent.atlassian.net"
-          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_RELEASE_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_RELEASE_API_TOKEN }}
+          JIRA_PROJECT_KEY: "RELEASE"
           JIRA_ISSUE_TYPE: ${{ env.JIRA_ISSUE_TYPE }}
           JIRA_SUMMARY: ${{ steps.collect.outputs.summary }}
           JIRA_DESCRIPTION: ${{ steps.collect.outputs.description }}
