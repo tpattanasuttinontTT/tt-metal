@@ -386,9 +386,14 @@ inline void calculate_reciprocal() {
 
 template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool legacy_compat = false>
 void recip_init() {
-    // Full common SFPU init (config reg + ADDR_MOD_7 + ADDR_MOD_6 + reset). SDPA runs reciprocal in its
-    // softmax after matmul/exp, so the general SFPU state must be re-established here, not just reset.
-    _llk_math_eltwise_unary_sfpu_init_<SfpuType::reciprocal>();
+    // Common SFPU init inlined (SFPU config register + ADDR_MOD_7 + reciprocal's ADDR_MOD_6 + counter
+    // reset), then the op-specific reciprocal setup below -- one self-contained init, matching exp_init.
+    // SDPA runs reciprocal in its softmax after matmul/exp, so the general SFPU state is re-established
+    // here, not just reset. Reciprocal uses ADDR_MOD_6 (dest incr 2) on Blackhole.
+    sfpu::_init_sfpu_config_reg();
+    addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 0}}.set(ADDR_MOD_7);
+    addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6);
+    math::reset_counters(p_setrwc::SET_ABD_F);
     if constexpr (!legacy_compat) {
         if constexpr (APPROXIMATION_MODE) {
             _init_reciprocal_fast_7b_();
