@@ -594,6 +594,72 @@ def strip_terminal_sequences(value: str) -> str:
     return CSI_SEQUENCE_RE.sub("", OSC_SEQUENCE_RE.sub("", value))
 
 
+def visible_len(value: str) -> int:
+    return len(strip_terminal_sequences(value))
+
+
+def clean_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
+
+
+def pad_cell(value: str, width: int) -> str:
+    return value + (" " * max(width - visible_len(value), 0))
+
+
+def truncate(value: str, max_width: int) -> str:
+    if visible_len(value) <= max_width:
+        return value
+
+    plain_value = strip_terminal_sequences(value)
+    if max_width <= 3:
+        return plain_value[:max_width]
+    return f"{plain_value[: max_width - 3]}..."
+
+
+def render_table(
+    rows: list[dict[str, Any]], columns: list[tuple[str, str, int]]
+) -> str:
+    if not rows:
+        return "(no rows)"
+
+    rendered_rows = [
+        [truncate(clean_cell(row.get(key)), max_width) for key, _, max_width in columns]
+        for row in rows
+    ]
+    header_lines_by_column = [label.splitlines() or [""] for _, label, _ in columns]
+    header_height = max(len(lines) for lines in header_lines_by_column)
+    widths = [
+        max(
+            *(visible_len(line) for line in header_lines_by_column[index]),
+            *(visible_len(row[index]) for row in rendered_rows),
+        )
+        for index in range(len(columns))
+    ]
+
+    header_rows = []
+    for line_index in range(header_height):
+        header_rows.append(
+            " | ".join(
+                pad_cell(
+                    header_lines_by_column[column_index][line_index]
+                    if line_index < len(header_lines_by_column[column_index])
+                    else "",
+                    widths[column_index],
+                )
+                for column_index in range(len(columns))
+            )
+        )
+    separator_line = "-+-".join("-" * width for width in widths)
+    body_lines = [
+        " | ".join(pad_cell(row[index], widths[index]) for index in range(len(row)))
+        for row in rendered_rows
+    ]
+
+    return "\n".join([*header_rows, separator_line, *body_lines])
+
+
 def signature_found(log_text: str, signature: ErrorSignature) -> bool:
     if signature.pattern:
         flags = 0 if signature.case_sensitive else re.IGNORECASE
@@ -716,6 +782,75 @@ def scan_jobs(
     )
 
 
+def should_scan_log_for_full_table(job: RecentJob) -> bool:
+    conclusion = job.conclusion.lower()
+    return bool(job.job_id) and conclusion not in {"skipped", "cancelled"}
+
+
+def full_runner_log_table_results(
+    *,
+    recent_jobs: list[RecentJob],
+    initial_scan_results: list[JobScanResult],
+    failures: list[JobScanResult],
+    gh_timeout: int,
+    log_workers: int,
+) -> list[JobScanResult]:
+    affected_runners = {
+        runner_name_for_job(result.job)
+        for result in failures
+        if runner_name_for_job(result.job) != UNKNOWN_RUNNER
+    }
+    if not affected_runners:
+        return []
+
+    results_by_key = {
+        job_state_key(result.job): result
+        for result in initial_scan_results
+        if runner_name_for_job(result.job) in affected_runners
+    }
+    table_jobs = [
+        job for job in recent_jobs if runner_name_for_job(job) in affected_runners
+    ]
+    jobs_to_scan = [
+        job
+        for job in table_jobs
+        if job_state_key(job) not in results_by_key and should_scan_log_for_full_table(job)
+    ]
+
+    if jobs_to_scan:
+        print(
+            "Scanning "
+            f"{len(jobs_to_scan)} additional job log(s) for full runner tables."
+        )
+        for result in scan_jobs(
+            jobs_to_scan,
+            gh_timeout=gh_timeout,
+            log_workers=log_workers,
+        ):
+            results_by_key[job_state_key(result.job)] = result
+
+    for job in table_jobs:
+        key = job_state_key(job)
+        if key not in results_by_key:
+            conclusion = job.conclusion or job.status or "unknown"
+            results_by_key[key] = JobScanResult(
+                job=job,
+                log_status=f"not checked: {conclusion}",
+                log_checked=False,
+                signature_labels=(),
+                fabric_missing_links="",
+            )
+
+    return [
+        results_by_key[job_state_key(job)]
+        for job in sorted(
+            table_jobs,
+            key=lambda table_job: parse_github_time(table_job.started_at),
+            reverse=True,
+        )
+    ]
+
+
 def mark_job_checked(state: dict[str, Any], result: JobScanResult) -> None:
     state.setdefault("checked_jobs", {})[job_state_key(result.job)] = {
         "checked_at": format_utc(datetime.now(timezone.utc)),
@@ -790,10 +925,6 @@ def group_results_by_runner(
     for result in results:
         grouped.setdefault(runner_name_for_job(result.job), []).append(result)
     return grouped
-
-
-def jobs_for_runner(jobs: list[RecentJob], runner: str) -> list[RecentJob]:
-    return [job for job in jobs if runner_name_for_job(job) == runner]
 
 
 def markdown_escape(value: str) -> str:
@@ -887,6 +1018,7 @@ def build_json_report(
     failed_jobs: list[RecentJob],
     jobs_to_scan: list[RecentJob],
     scan_results: list[JobScanResult],
+    runner_log_table_results: list[JobScanResult],
 ) -> dict[str, Any]:
     failures = [result for result in scan_results if result.signature_labels]
     return {
@@ -908,6 +1040,7 @@ def build_json_report(
             "failed_jobs": len(failed_jobs),
             "jobs_to_scan": len(jobs_to_scan),
             "scanned_jobs": len(scan_results),
+            "runner_log_table_jobs": len(runner_log_table_results),
             "runner_failure_jobs": len(failures),
         },
         "signature_counts": signature_counts(failures),
@@ -919,6 +1052,9 @@ def build_json_report(
             for runner, results in sorted(group_results_by_runner(failures).items())
         },
         "scan_results": [result_to_dict(result) for result in scan_results],
+        "runner_log_table_results": [
+            result_to_dict(result) for result in runner_log_table_results
+        ],
     }
 
 
@@ -1000,13 +1136,6 @@ def load_report_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def jobs_from_report_field(report: dict[str, Any], field: str) -> list[RecentJob]:
-    values = report.get(field)
-    if not isinstance(values, list):
-        return []
-    return [job_from_dict(value) for value in values if isinstance(value, dict)]
-
-
 def scan_results_from_report(report: dict[str, Any]) -> list[JobScanResult]:
     values = report.get("scan_results")
     if not isinstance(values, list):
@@ -1030,15 +1159,20 @@ def post_slack_alerts_from_report(
 ) -> None:
     scan_results = scan_results_from_report(report)
     failures = [result for result in scan_results if result.signature_labels]
-    recent_jobs = jobs_from_report_field(report, "recent_jobs")
-    if not recent_jobs:
-        recent_jobs = [result.job for result in scan_results]
+    raw_runner_log_table_results = report.get("runner_log_table_results")
+    runner_log_table_results = []
+    if isinstance(raw_runner_log_table_results, list):
+        runner_log_table_results = [
+            scan_result_from_dict(value)
+            for value in raw_runner_log_table_results
+            if isinstance(value, dict)
+        ]
     post_slack_alerts(
         slack_config,
         hours=int_from_report(report.get("hours"), default=24),
-        recent_jobs=recent_jobs,
         failures=failures,
         scan_results=scan_results,
+        runner_log_table_results=runner_log_table_results,
     )
 
 
@@ -1124,49 +1258,84 @@ def format_triggering_jobs_for_slack(
     return truncate_for_slack("\n".join(lines))
 
 
-def format_runner_context_for_slack(
-    runner: str,
-    recent_jobs: list[RecentJob],
-    scan_results_by_key: dict[str, JobScanResult],
-) -> str:
-    context_jobs = jobs_for_runner(recent_jobs, runner)
-    lines = [
-        f"GitHub runner context for `{slack_escape(runner)}` "
-        "(configured workflows only):",
-    ]
-    for job in context_jobs[:60]:
-        result = scan_results_by_key.get(job_state_key(job))
-        signatures = ""
-        if result and result.signature_labels:
-            signatures = f" - {', '.join(result.signature_labels)}"
-            if result.fabric_missing_links:
-                signatures += f" ({result.fabric_missing_links})"
-        lines.append(
-            "* "
-            f"{slack_link(job.html_url, job.job_id)} "
-            f"{slack_escape(job.workflow)} / "
-            f"{slack_escape(job.name)} - "
-            f"{slack_escape(job.conclusion or job.status or 'unknown')}"
-            f"{slack_escape(signatures)}"
+def signature_cell(result: JobScanResult, label: str) -> str:
+    if not result.log_checked:
+        return ""
+    return "YES" if label in result.signature_labels else "NO"
+
+
+def runner_log_table_rows(results: list[JobScanResult]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        job = result.job
+        rows.append(
+            {
+                "GITHUB_RUN_ID": job.run_id,
+                "GITHUB_JOB_ID": job.job_id,
+                "GITHUB_JOB_LINK_DISPLAY": "open" if job.html_url else "",
+                "WORKFLOW": job.workflow,
+                "JOB_NAME": job.name,
+                "JOB_STATUS": job.conclusion or job.status,
+                "JOB_START_TS": job.started_at,
+                "LOG_CHECKED": "YES" if result.log_checked else "NO",
+                "TLB_ERROR_FOUND": signature_cell(result, "TLB error"),
+                "MISSING_DEVICES_FOUND": signature_cell(result, "Missing devices"),
+                "FABRIC_LINK_DOWN_MGD_TOPOLOGY_FOUND": signature_cell(
+                    result, "Fabric link down (MGD topology)"
+                ),
+                "FABRIC_MISSING_LINKS": result.fabric_missing_links,
+                "OUT_OF_DISK_FOUND": signature_cell(result, "Out of disk"),
+            }
         )
-    if len(context_jobs) > 60:
-        lines.append(f"... {len(context_jobs) - 60} more job(s)")
-    return truncate_for_slack("\n".join(lines))
+    return rows
+
+
+def format_runner_log_table_for_slack(
+    runner: str, results: list[JobScanResult]
+) -> str:
+    table = render_table(
+        runner_log_table_rows(results),
+        [
+            ("GITHUB_RUN_ID", "GH run", 13),
+            ("GITHUB_JOB_ID", "GH job", 13),
+            ("GITHUB_JOB_LINK_DISPLAY", "GH link", 7),
+            ("WORKFLOW", "Workflow", 24),
+            ("JOB_NAME", "Job name", 48),
+            ("JOB_STATUS", "Status", 16),
+            ("JOB_START_TS", "Started", 20),
+            ("LOG_CHECKED", "Log checked", 11),
+            ("TLB_ERROR_FOUND", "TLB error", 9),
+            ("MISSING_DEVICES_FOUND", "Missing devices", 15),
+            (
+                "FABRIC_LINK_DOWN_MGD_TOPOLOGY_FOUND",
+                "Fabric link\ndown (MGD\ntopology)",
+                11,
+            ),
+            ("FABRIC_MISSING_LINKS", "Missing links", 44),
+            ("OUT_OF_DISK_FOUND", "Out of disk", 11),
+        ],
+    )
+    return (
+        f"Full log signature table for `{slack_escape(runner)}` "
+        "(`check-logs all` style, configured workflows only):\n"
+        f"{slack_code_block(table)}"
+    )
 
 
 def post_slack_alerts(
     slack_config: SlackConfig,
     *,
     hours: int,
-    recent_jobs: list[RecentJob],
     failures: list[JobScanResult],
     scan_results: list[JobScanResult],
+    runner_log_table_results: list[JobScanResult] | None = None,
 ) -> None:
     if not failures:
         print("No runner-failure signatures found; skipping Slack notifications.")
         return
 
-    scan_results_by_key = {job_state_key(result.job): result for result in scan_results}
+    table_results = runner_log_table_results or scan_results
+    table_results_by_runner = group_results_by_runner(table_results)
     for runner, runner_results in sorted(group_results_by_runner(failures).items()):
         signature_summary = format_signature_summary(runner_results)
         if not signature_summary:
@@ -1184,8 +1353,8 @@ def post_slack_alerts(
         )
         post_slack_message(
             slack_config,
-            format_runner_context_for_slack(
-                runner, recent_jobs, scan_results_by_key
+            format_runner_log_table_for_slack(
+                runner, table_results_by_runner.get(runner, runner_results)
             ),
             thread_ts=thread_ts,
         )
@@ -1244,6 +1413,13 @@ def main() -> int:
 
     save_state(args.state_out, state)
     failures = [result for result in scan_results if result.signature_labels]
+    runner_log_table_results = full_runner_log_table_results(
+        recent_jobs=recent_jobs,
+        initial_scan_results=scan_results,
+        failures=failures,
+        gh_timeout=args.gh_timeout,
+        log_workers=args.log_workers,
+    )
 
     report_json = build_json_report(
         generated_at=generated_at,
@@ -1254,6 +1430,7 @@ def main() -> int:
         failed_jobs=failed,
         jobs_to_scan=jobs_to_scan,
         scan_results=scan_results,
+        runner_log_table_results=runner_log_table_results,
     )
     report_md = build_markdown_report(
         generated_at=generated_at,

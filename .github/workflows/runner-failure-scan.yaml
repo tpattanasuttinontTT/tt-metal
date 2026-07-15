@@ -1,6 +1,9 @@
 name: "(triage) Runner Failure Scan"
 
 on:
+  schedule:
+    # Offset from :00, which GitHub sheds first under load.
+    - cron: "17 * * * *"
   push:
     branches:
       - tcheda/runner-failure-scan-prototype
@@ -123,7 +126,7 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           DEFAULT_SLACK_CHANNEL: ${{ secrets.RUNNER_FAILURE_SCAN_CHANNEL }}
           INPUT_SLACK_CHANNEL: ${{ github.event.inputs.slack-channel-id }}
-          POST_TO_SLACK: ${{ github.event_name == 'push' || github.event.inputs.post-to-slack == 'true' }}
+          POST_TO_SLACK: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event.inputs.post-to-slack == 'true' }}
         run: |
           if [[ "$POST_TO_SLACK" != "true" ]]; then
             echo "Slack posting was not requested."
