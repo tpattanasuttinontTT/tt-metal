@@ -41,7 +41,11 @@ from models.demos.deepseek_v3_d_p.reference.deepseek_v3_config import DeepSeekV3
 from models.demos.deepseek_v3_d_p.reference.glm_5_1_config import GLM51Config
 from models.demos.deepseek_v3_d_p.reference.kimi_k2_6_config import KimiK26Config
 from models.demos.deepseek_v3_d_p.tt.mla.indexer import resolve_has_indexer
-from models.demos.deepseek_v3_d_p.tt.mla.utils import blockcyclic_positions, rotated_chip_positions
+from models.demos.deepseek_v3_d_p.tt.mla.utils import (
+    blockcyclic_cache_host,
+    blockcyclic_positions,
+    rotated_chip_positions,
+)
 from models.demos.deepseek_v3_d_p.tt.moe.init_helpers import create_fabric_router_config
 from models.demos.deepseek_v3_d_p.tt.moe.tt_moe_gate_prefill import GateComputeMode
 from models.demos.deepseek_v3_d_p.tt.tt_prefill_block import get_block_timings, reset_block_timings
@@ -199,6 +203,65 @@ def _record_kv_cache_pcc(
         cache_min_pcc[i] = min(pcc_nope, pcc_pe)
         logger.info(f"  cache layer {i} PCC: nope={pcc_nope:.6f} pe(interleaved)={pcc_pe:.6f}")
     logger.info(f"KV cache min PCC across layers: {min(cache_min_pcc.values()):.6f}")
+
+
+def _preload_kvpe_prefix_from_trace(
+    tt_kvpe_cache,
+    trace_dir,
+    layout,
+    num_layers,
+    preload_isl,
+    trace_len,
+    sp,
+    seq_len_cache,
+    kvpe_dim,
+    kv_lora,
+    mesh_device,
+    sp_axis,
+    host_dtype,
+    host_layout,
+):
+    """Preload the first `preload_isl` tokens of each layer's prior KV into the block-cyclic device KVPE
+    cache, so a chunk measured at KV depth preload_isl attends to REAL prior KV (representative MoE routing)
+    instead of the zero-init prefix. Mirrors test_mla.py's chunked preload: per layer read the natural-order
+    prior KV from the trace's kv_post_transform, re-interleave the k_pe slice (the trace stores HF half-split;
+    the device cache is Meta interleaved), lay it out block-cyclic, and copy host->device.
+
+    Rows past `trace_len` (the trace only goes so deep) are filled with RANDOM KV so we can still exercise
+    KV depths beyond the trace — random keeps the MoE gate non-degenerate (unlike a zero prefix), which is
+    all this no-PCC timing run needs. Only KVPE is preloaded — the indexer key cache is not in the trace, so
+    its prior stays zero (the indexer top-k over the prior may be suboptimal, but sparse_sdpa still reads the
+    real KVPE those indices point at, so the attention output — and thus the MoE gate input — stays realistic)."""
+    real_len = min(preload_isl, trace_len)
+    rand_len = preload_isl - real_len
+    logger.info(
+        f"Preloading {preload_isl}-token KV prefix into {num_layers} layer slot(s) "
+        f"({real_len} real from trace {trace_dir}, {rand_len} random beyond the trace)"
+    )
+    # Build the replicated host cache in bf16 (the sparse KVPE cache dtype), not float32: at num_layers=78
+    # x SEQ_CACHE_NOPCC the float32 tensor would be ~19 GB. Per-layer transients (randn/blockcyclic) are
+    # freed each iteration, so the peak is this one bf16 tensor plus a single layer's working set.
+    cache_host = torch.zeros(num_layers, 1, seq_len_cache, kvpe_dim, dtype=torch.bfloat16)
+    d = kvpe_dim - kv_lora
+    gen = torch.Generator().manual_seed(1234)  # deterministic random tail
+    for i in range(num_layers):
+        kv_prior = torch.randn(preload_isl, kvpe_dim, generator=gen).to(torch.bfloat16)
+        if real_len > 0:
+            real = _load_layer_rows(trace_dir, layout, "kv_cache", i, f"kv_post_transform_layer_{i}", 0, real_len)
+            pe = real[:, kv_lora:]
+            real[:, kv_lora:] = torch.stack([pe[:, : d // 2], pe[:, d // 2 :]], dim=-1).reshape(pe.shape[0], d)
+            kv_prior[:real_len] = real.to(torch.bfloat16)
+        cache_host[i, 0] = blockcyclic_cache_host(kv_prior, sp, CHUNK, seq_len_cache, kvpe_dim)[0, 0]
+    cache_shard_dims = [None, None]
+    cache_shard_dims[sp_axis] = 2  # SP-shard the cache seq dim; TP-replicate (matches init_kvpe_cache)
+    cache_host_tt = ttnn.from_torch(
+        cache_host,
+        dtype=host_dtype,
+        layout=host_layout,
+        mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_device.shape), dims=cache_shard_dims),
+    )
+    ttnn.copy_host_to_device_tensor(cache_host_tt, tt_kvpe_cache)
+    ttnn.synchronize_device(mesh_device)
 
 
 def run_chunked_transformer_padded(
@@ -882,12 +945,24 @@ def run_chunked_transformer_no_pcc(
     routing_use_l1_small_for_semaphores=False,
     baseline_chunk_times_s=None,
     perf_margin=None,
+    preload_isl=0,
 ):
     """No-PCC perf/smoke variant of run_chunked_transformer: build the transformer ONCE, then drive the
     full n_chunks-chunk prefill `num_iters` times with return_intermediates=False (no per-layer host
     readback, no PCC). Tokens are the real (longbook) ids from the golden trace when present, else a
     deterministic in-vocab pattern, so this is trace-optional. The KV cache is reused across iterations
-    (each chunk overwrites the same [0, total_len) region in order).
+    (each chunk overwrites the same [preload_isl, preload_isl + measured_len) region in order).
+
+    `preload_isl` (must be a multiple of CHUNK): treat the cache as already holding this many prior KV
+    tokens, so the measured chunks run at absolute KV positions [preload_isl, preload_isl + n_chunks*CHUNK)
+    instead of starting at 0. This lets the MLA-vs-FFN ratio be measured at a target KV depth WITHOUT first
+    running chunked prefill up to that point. The prior [0, preload_isl) KVPE is preloaded from the golden
+    trace (kv_post_transform, block-cyclic; see _preload_kvpe_prefix_from_trace) so the measured chunk
+    attends to REAL prior KV — the MoE gate then sees realistic hidden states and routes representatively
+    (a zero prefix would degrade routing). preload_isl>0 therefore requires a trace (set PREFILL_TRACE_DIR);
+    KV depths beyond the trace length are filled with random KV (still non-degenerate for routing) so larger
+    ISLs than the trace can be exercised. NOTE: the KVPE gather is already full-cache-width (SEQ_CACHE_NOPCC)
+    every chunk, so that fixed component does not grow with preload_isl.
 
     Perf gate: when `baseline_chunk_times_s` is provided (a per-chunk list of baseline medians pulled
     from a known-good CI run), each chunk's measured median must stay within +/- `perf_margin` of its
@@ -975,15 +1050,20 @@ def run_chunked_transformer_no_pcc(
     assert (sp, tp) == (8, 4), f"this test targets mesh-8x4, got {mesh_shape}"
 
     chunk_local = CHUNK // sp  # 640
-    total_len = n_chunks * CHUNK
-    assert total_len <= SEQ_CACHE_NOPCC, f"{n_chunks} chunks ({total_len}) exceed cache {SEQ_CACHE_NOPCC}"
+    assert preload_isl % CHUNK == 0, f"preload_isl ({preload_isl}) must be a multiple of CHUNK ({CHUNK})"
+    measured_len = n_chunks * CHUNK  # tokens actually run this call
+    total_len = preload_isl + measured_len  # logical seq length: preloaded prefix + measured chunks
+    assert (
+        total_len <= SEQ_CACHE_NOPCC
+    ), f"preload_isl {preload_isl} + {n_chunks} chunks ({measured_len}) = {total_len} exceed cache {SEQ_CACHE_NOPCC}"
 
     kvpe_dim = config.qk_rope_head_dim + config.kv_lora_rank
     config.max_seq_len = SEQ_CACHE_NOPCC
 
     logger.info(
         f"chunked transformer (no-PCC): num_layers={num_layers} mesh={mesh_shape} n_chunks={n_chunks} "
-        f"total_len={total_len} cache={SEQ_CACHE_NOPCC} chunk={CHUNK} num_iters={num_iters}"
+        f"preload_isl={preload_isl} total_len={total_len} cache={SEQ_CACHE_NOPCC} chunk={CHUNK} "
+        f"num_iters={num_iters}"
     )
 
     iteration_chunk_times: list[list[float]] = []
@@ -997,13 +1077,20 @@ def run_chunked_transformer_no_pcc(
         trace_dir = _resolve_trace_dir(variant)
     except FileNotFoundError:
         trace_dir = None
+    # preload_isl needs REAL prior KV (for representative MoE routing), which only the golden trace has.
+    # KV depths beyond the trace are filled with random KV in the preload (see helper), so a trace is
+    # required for preload_isl>0 but preload_isl may exceed the trace length.
+    if preload_isl > 0 and (trace_dir is None or not trace_dir.exists()):
+        pytest.skip(f"preload_isl={preload_isl} requires a golden trace; none found (set PREFILL_TRACE_DIR)")
+    trace_native_len = 0  # native token/KV length of the trace; 0 when no trace
     if trace_dir is not None and trace_dir.exists():
         trace_tokens = _load_metadata_token_ids(trace_dir, total_len)
+        trace_native_len = trace_tokens.numel()
         if trace_tokens.numel() < total_len:
             reps = (total_len + trace_tokens.numel() - 1) // trace_tokens.numel()
             trace_tokens = trace_tokens.repeat(reps)[:total_len]
         token_ids_full = trace_tokens % vocab_size
-        logger.info(f"no-PCC: loaded {token_ids_full.numel()} token ids from trace {trace_dir}")
+        logger.info(f"no-PCC: loaded {trace_native_len} token ids from trace {trace_dir}")
     else:
         token_ids_full = torch.arange(total_len, dtype=torch.int64) % vocab_size
         logger.info(f"no-PCC: trace not found ({trace_dir}); using synthetic token ids")
@@ -1078,11 +1165,31 @@ def run_chunked_transformer_no_pcc(
             dtype=ttnn.bfloat8_b,
         )
 
+    # preload_isl > 0: seed the prior [0, preload_isl) KVPE from the golden trace so the measured chunk
+    # attends to real KV -> representative MoE routing (the whole reason preload beats a zero prefix).
+    if preload_isl > 0:
+        _preload_kvpe_prefix_from_trace(
+            tt_kvpe_cache,
+            trace_dir,
+            variant.prefill_trace_layout,
+            num_layers,
+            preload_isl,
+            trace_native_len,
+            sp,
+            SEQ_CACHE_NOPCC,
+            kvpe_dim,
+            config.kv_lora_rank,
+            mesh_device,
+            sp_axis,
+            kvpe_dtype_layout.get("dtype", ttnn.bfloat8_b),
+            kvpe_dtype_layout.get("layout", ttnn.TILE_LAYOUT),
+        )
+
     # Precompute per-chunk SP-sharded token tiles once (reused across iterations). Chunk-aligned offsets
     # make the block-cyclic rotation degenerate to a plain per-chip reshape.
     chunk_tok_host = []
     for c in range(n_chunks):
-        kv_actual = c * CHUNK
+        kv_actual = preload_isl + c * CHUNK
         positions = rotated_chip_positions(kv_actual, sp, chunk_local)
         flat = torch.tensor([positions[ch][r] for ch in range(sp) for r in range(chunk_local)], dtype=torch.long)
         chunk_tok_host.append(token_ids_full[flat].reshape(sp, 1, chunk_local))
@@ -1104,12 +1211,13 @@ def run_chunked_transformer_no_pcc(
             layout=ttnn.ROW_MAJOR_LAYOUT,
             mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=tuple(mesh_shape), dims=(0, None)),
         )
+        # Warm at the measured region's first offset (preload_isl) so the JITted programs match exactly.
         transformer.forward(
             warm_tokens,
             tt_kvpe_cache,
             actual_isl=CHUNK,
-            actual_start=0,
-            actual_end=CHUNK,
+            actual_start=preload_isl,
+            actual_end=preload_isl + CHUNK,
             cache_user_id=0,
             return_intermediates=False,
             index_kv_cache=tt_index_kv_cache,
@@ -1124,7 +1232,7 @@ def run_chunked_transformer_no_pcc(
         iter_start = time.time()
         chunk_times: list[float] = []
         for c in range(n_chunks):
-            kv_actual = c * CHUNK
+            kv_actual = preload_isl + c * CHUNK
             tt_tokens = ttnn.from_torch(
                 chunk_tok_host[c],
                 device=mesh_device,
@@ -1369,6 +1477,16 @@ def test_ds_prefill_transformer_chunked_no_pcc(
     [1, 2, 5, 10, 11, 20],
     ids=["chunks1", "chunks2", "chunks5", "chunks10", "chunks_eleven", "chunks20"],
 )
+# preload_isl (multiple of CHUNK): pretend the cache already holds this many prior KV tokens so the
+# measured chunks run at KV depth [preload_isl, preload_isl + n_chunks*CHUNK) WITHOUT first running prefill
+# up to that point. Pair with n_chunks=1 to sweep single-chunk ratio vs depth. 0 = start from empty cache.
+# Chunk-multiple KV depths to seed before measuring. Depths within the ~55k golden trace use real KV; the
+# rest (e.g. preload95k) fills random KV beyond the trace so larger ISLs than the trace can be measured.
+@pytest.mark.parametrize(
+    "preload_isl",
+    [0, 5 * CHUNK, 10 * CHUNK, 19 * CHUNK],
+    ids=["preload0", "preload25k", "preload50k", "preload95k"],
+)
 @pytest.mark.parametrize("num_layers", [1, 10, 78], ids=["L1", "L10", "L78"])
 @pytest.mark.parametrize(
     "mesh_device, device_params, num_links, topology",
@@ -1406,7 +1524,10 @@ def test_glm_prefill_transformer_chunked_no_pcc(
     num_iters,
     num_links,
     topology,
+    preload_isl,
 ):
+    if preload_isl + n_chunks * CHUNK > SEQ_CACHE_NOPCC:
+        pytest.skip(f"preload_isl {preload_isl} + {n_chunks} chunks exceeds the {SEQ_CACHE_NOPCC}-token cache")
     run_chunked_transformer_no_pcc(
         variant,
         config_only,
@@ -1419,4 +1540,5 @@ def test_glm_prefill_transformer_chunked_no_pcc(
         topology,
         num_iters,
         routing_use_l1_small_for_semaphores=True,
+        preload_isl=preload_isl,
     )
