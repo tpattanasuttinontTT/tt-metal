@@ -726,7 +726,9 @@ template <
     bool CLAMP_NEGATIVE = true,
     bool is_fp32_dest_acc_en = false>
 void exp_init() {
-    math::reset_counters(p_setrwc::SET_ABD_F);
+    // Include the full common SFPU init (config reg + ADDR_MOD_7 + reset) so this op init is
+    // self-contained on silicon; the generic prefix that used to run it was dropped in the migration.
+    _llk_math_eltwise_unary_sfpu_init_<SfpuType::exponential>();
     if constexpr (APPROXIMATION_MODE && CLAMP_NEGATIVE) {
         // Algorithm is adapted from:
         //      A Fast, Compact Approximation of the Exponential Function

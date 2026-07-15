@@ -5,6 +5,7 @@
 #pragma once
 
 #include "ckernel.h"
+#include "llk_math_eltwise_unary_sfpu.h"
 #include "sfpi.h"
 #include "sfpu/ckernel_sfpu_polyval.h"
 #include "ckernel_sfpu_recip.h"
@@ -77,6 +78,8 @@ inline void calculate_snake_beta(uint dst_index_x, uint dst_index_alpha, uint ds
 
 template <bool APPROXIMATE>
 inline void snake_beta_init() {
+    // Self-contained: full common SFPU init (config reg + ADDR_MOD_7 + reset), then op-specific.
+    _llk_math_eltwise_unary_sfpu_init_<SfpuType::snake_beta>();
     sfpu_reciprocal_init<APPROXIMATE>();
 }
 
