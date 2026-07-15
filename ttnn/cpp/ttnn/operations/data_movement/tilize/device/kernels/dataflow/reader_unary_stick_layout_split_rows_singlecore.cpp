@@ -77,6 +77,10 @@ void kernel_main() {
                 if ((src_noc_addr & dram_align_offset_mask) ==
                     (static_cast<uint64_t>(l1_write_addr) & dram_align_offset_mask)) {
                     // Same alignment offset — direct read into c_0 is safe.
+                    // No per-row barrier: each row writes to a distinct l1_write_addr so reads
+                    // can pipeline.  They will be flushed either by the next misaligned row's
+                    // barrier below (which drains ALL pending reads before the memmove), or by
+                    // the unconditional block-end barrier after the loop.
                     CoreLocalMem<uint32_t> dst(l1_write_addr);
                     noc.async_read(
                         s,
@@ -84,10 +88,11 @@ void kernel_main() {
                         width_size,
                         {.page_id = stick_ids[k], .offset_bytes = stick_offset},
                         {.offset_bytes = 0});
-                    noc.async_read_barrier();
                 } else {
                     // Misaligned: issue an aligned over-read into the staging buffer, then
                     // copy only the valid width_size bytes into c_0.
+                    // The barrier here drains ALL pending reads — including any pipelined
+                    // same-offset reads issued above — before temp_addr is read by memmove.
                     const uint64_t aligned_src = src_noc_addr & dram_align_mask;
                     const uint32_t src_offset_in_block = static_cast<uint32_t>(src_noc_addr & dram_align_offset_mask);
 
@@ -116,10 +121,11 @@ void kernel_main() {
 
         stick_offset += width_size;
 
-        if constexpr (dram_alignment == 0) {
-            // All reads for this block were issued without per-row barriers; flush them now.
-            noc.async_read_barrier();
-        }
+        // Unconditional block-end barrier.
+        //   dram_alignment == 0 (WH / wide sticks): flushes all batched aligned reads.
+        //   dram_alignment > 0 (BH narrow UINT8): flushes any trailing same-offset reads
+        //     that were not already drained by a subsequent misaligned row's per-row barrier.
+        noc.async_read_barrier();
 
         cb_in0.push_back(num_tiles);
     };
