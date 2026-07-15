@@ -75,8 +75,8 @@ void MaskedPerTokenCastBackDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(
         input_e4m3.dtype() == tt::tt_metal::DataType::FP8_E4M3,
         "masked_per_token_cast_back: input_e4m3 dtype must be FP8_E4M3");
-    // Scale source dtype: plain scale path requires FLOAT32; metadata path carries the fp32 scales
-    // bit-stored in the int32 metadata tail, so UINT32/INT32 are also accepted there.
+    // Scale source dtype: plain scale path accepts FLOAT32 or BFLOAT16; metadata path carries the fp32
+    // scales bit-stored in the int32 metadata tail, so UINT32/INT32 are also accepted there.
     if (scales_from_metadata) {
         const auto sdt = input_scale.dtype();
         TT_FATAL(
@@ -85,9 +85,11 @@ void MaskedPerTokenCastBackDeviceOperation::validate_on_program_cache_miss(
             "masked_per_token_cast_back: metadata scale source dtype must be FLOAT32/UINT32/INT32, got {}",
             sdt);
     } else {
+        const auto sdt = input_scale.dtype();
         TT_FATAL(
-            input_scale.dtype() == tt::tt_metal::DataType::FLOAT32,
-            "masked_per_token_cast_back: input_scale dtype must be FLOAT32");
+            sdt == tt::tt_metal::DataType::FLOAT32 || sdt == tt::tt_metal::DataType::BFLOAT16,
+            "masked_per_token_cast_back: input_scale dtype must be FLOAT32 or BFLOAT16, got {}",
+            sdt);
     }
 
     const auto tile_shape = input_e4m3.tensor_spec().tile().get_tile_shape();
@@ -206,6 +208,10 @@ ttsl::hash::hash_t MaskedPerTokenCastBackDeviceOperation::compute_program_hash(
     return tt::tt_metal::operation::hash_operation<MaskedPerTokenCastBackDeviceOperation>(
         attrs,
         tensor_args.input_e4m3.dtype(),
+        // Scale dtype selects the compiled program (fp32/HiFi4 vs bf16/HiFi2 datapath, scale_elem_bytes),
+        // so it must be part of the hash — otherwise a later call with a different scale dtype reuses the
+        // wrong cached program.
+        tensor_args.input_scale.dtype(),
         tensor_args.input_e4m3.memory_config(),
         tensor_args.input_scale.memory_config(),
         tensor_args.expert_region_offsets.memory_config(),
