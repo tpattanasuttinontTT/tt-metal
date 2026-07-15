@@ -18,6 +18,9 @@ on:
       slack_channel_id:
         description: "Slack channel ID. Leave empty to use RUNNER_FAILURE_SCAN_CHANNEL."
         required: false
+      scan_report_artifact_name:
+        description: "Optional scan artifact name with triggering failures."
+        required: false
   workflow_call:
     inputs:
       runner_name:
@@ -32,6 +35,10 @@ on:
         type: boolean
         default: true
       slack_channel_id:
+        required: false
+        type: string
+        default: ""
+      scan_report_artifact_name:
         required: false
         type: string
         default: ""
@@ -91,7 +98,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-          RUNNER_NAME: ${{ inputs.runner_name }}
+          TARGET_RUNNER_NAME: ${{ inputs.runner_name }}
           HOURS: ${{ inputs.hours || '24' }}
         run: |
           mkdir -p out
@@ -99,9 +106,16 @@ jobs:
           python3 .github/scripts/runner_failure_report.py \
             --config out/runner_failure_scan_workflows.yaml \
             --hours "$HOURS" \
-            --runner-name "$RUNNER_NAME" \
+            --runner-name "$TARGET_RUNNER_NAME" \
             --report-json out/runner_failure_report.json \
             --report-md out/runner_failure_report.md
+
+      - name: Download triggering scan report
+        if: inputs.scan_report_artifact_name != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.scan_report_artifact_name }}
+          path: scan-report
 
       - name: Post Slack notification
         if: always() && hashFiles('out/runner_failure_report.json') != ''
@@ -110,6 +124,7 @@ jobs:
           DEFAULT_SLACK_CHANNEL: ${{ secrets.RUNNER_FAILURE_SCAN_CHANNEL }}
           INPUT_SLACK_CHANNEL: ${{ inputs.slack_channel_id }}
           POST_TO_SLACK: ${{ inputs.post_to_slack }}
+          TARGET_RUNNER_NAME: ${{ inputs.runner_name }}
         run: |
           if [[ "$POST_TO_SLACK" != "true" ]]; then
             echo "Slack posting was not requested."
@@ -122,9 +137,17 @@ jobs:
             exit 0
           fi
 
-          python3 .github/scripts/runner_failure_post_slack.py \
-            --runner-report-json out/runner_failure_report.json \
+          args=(
+            --runner-report-json out/runner_failure_report.json
             --slack-channel "$slack_channel"
+          )
+          if [[ -f scan-report/runner_failure_report.json ]]; then
+            args+=(
+              --scan-report-json scan-report/runner_failure_report.json
+              --runner-name "$TARGET_RUNNER_NAME"
+            )
+          fi
+          python3 .github/scripts/runner_failure_post_slack.py "${args[@]}"
 
       - name: Add report to step summary
         if: always() && hashFiles('out/runner_failure_report.md') != ''
@@ -134,7 +157,7 @@ jobs:
         if: always() && hashFiles('out/runner_failure_report.*') != ''
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: runner-failure-report-${{ github.run_id }}
+          name: runner-failure-report-${{ inputs.runner_name }}-${{ github.run_id }}
           path: |
             out/runner_failure_report.json
             out/runner_failure_report.md

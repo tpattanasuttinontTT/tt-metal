@@ -44,6 +44,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to a completed single-runner report JSON.",
     )
     parser.add_argument(
+        "--scan-report-json",
+        type=Path,
+        help="Optional scan report JSON containing the triggering runner failures.",
+    )
+    parser.add_argument(
+        "--runner-name",
+        help="Runner/host name to select from --scan-report-json.",
+    )
+    parser.add_argument(
         "--slack-channel",
         default=os.environ.get("RUNNER_FAILURE_SCAN_SLACK_CHANNEL"),
         help="Slack channel ID for runner-failure summaries.",
@@ -129,6 +138,33 @@ def int_from_report(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def triggering_results_from_scan_report(
+    scan_report: dict[str, Any] | None, runner_name: str
+) -> list[JobScanResult]:
+    if not scan_report:
+        return []
+
+    runner_failures = scan_report.get("runner_failures")
+    if not isinstance(runner_failures, dict):
+        return []
+
+    raw_values = runner_failures.get(runner_name)
+    if raw_values is None:
+        for candidate_runner, candidate_values in runner_failures.items():
+            if str(candidate_runner).casefold() == runner_name.casefold():
+                raw_values = candidate_values
+                break
+
+    if not isinstance(raw_values, list):
+        return []
+
+    return [
+        scan_result_from_dict(value)
+        for value in raw_values
+        if isinstance(value, dict)
+    ]
 
 
 def slack_escape(value: str) -> str:
@@ -330,6 +366,24 @@ def slack_runner_table_block(rows: list[list[dict[str, Any]]]) -> dict[str, Any]
     }
 
 
+def format_triggering_jobs_for_slack(
+    runner: str, results: list[JobScanResult]
+) -> str:
+    lines = [f"Triggering job failures for `{slack_escape(runner)}`:"]
+    for result in results:
+        signature_text = ", ".join(result.signature_labels)
+        if result.fabric_missing_links:
+            signature_text += f"; missing links: {result.fabric_missing_links}"
+        lines.append(
+            "* "
+            f"{slack_link(result.job.html_url, result.job.job_id)} "
+            f"{slack_escape(result.job.workflow)} / "
+            f"{slack_escape(result.job.name)} "
+            f"({slack_escape(signature_text)})"
+        )
+    return truncate_for_slack("\n".join(lines))
+
+
 def format_signature_flags_for_slack(result: JobScanResult) -> str:
     parts = [
         f"log:`{'Y' if result.log_checked else 'N'}`",
@@ -417,17 +471,24 @@ def post_runner_log_table_for_slack(
 
 
 def post_runner_report_from_report(
-    slack_config: SlackConfig, report: dict[str, Any]
+    slack_config: SlackConfig,
+    report: dict[str, Any],
+    *,
+    scan_report: dict[str, Any] | None = None,
+    runner_name_override: str | None = None,
 ) -> None:
-    runner_name = str(report.get("runner_name") or UNKNOWN_RUNNER)
+    runner_name = str(runner_name_override or report.get("runner_name") or UNKNOWN_RUNNER)
     scan_results = scan_results_from_report(report)
     hours = int_from_report(report.get("hours"), default=24)
-    failures = [result for result in scan_results if result.signature_labels]
+    report_failures = [result for result in scan_results if result.signature_labels]
+    triggering_failures = triggering_results_from_scan_report(scan_report, runner_name)
+    summary_failures = triggering_failures or report_failures
 
-    if failures:
+    if summary_failures:
         parent_text = (
             f"Detected runner failure on `{slack_escape(runner_name)}`: "
-            f"in the last {hours}h {slack_escape(format_signature_summary(failures))}. "
+            f"in the last {hours}h "
+            f"{slack_escape(format_signature_summary(summary_failures))}. "
             "Details in thread \U0001F9F5"
         )
     else:
@@ -438,6 +499,12 @@ def post_runner_report_from_report(
         )
 
     thread_ts = post_slack_message(slack_config, parent_text)
+    if triggering_failures:
+        post_slack_message(
+            slack_config,
+            format_triggering_jobs_for_slack(runner_name, triggering_failures),
+            thread_ts=thread_ts,
+        )
     post_runner_log_table_for_slack(
         slack_config,
         runner=runner_name,
@@ -454,7 +521,17 @@ def main() -> int:
         if slack_config is None:
             return 0
         report = load_report_json(args.runner_report_json)
-        post_runner_report_from_report(slack_config, report)
+        scan_report = (
+            load_report_json(args.scan_report_json)
+            if args.scan_report_json is not None
+            else None
+        )
+        post_runner_report_from_report(
+            slack_config,
+            report,
+            scan_report=scan_report,
+            runner_name_override=args.runner_name,
+        )
         return 0
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)

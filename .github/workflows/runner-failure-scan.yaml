@@ -138,7 +138,7 @@ jobs:
         if: always() && hashFiles('out/runner_failure_report.*') != ''
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: runner-failure-report-${{ github.run_id }}
+          name: runner-failure-scan-report-${{ github.run_id }}
           path: |
             out/runner_failure_report.json
             out/runner_failure_report.md
@@ -165,4 +165,5 @@ jobs:
       hours: ${{ github.event.inputs.hours || '24' }}
       post_to_slack: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event.inputs.post-to-slack == 'true' }}
       slack_channel_id: ${{ github.event.inputs.slack-channel-id || '' }}
+      scan_report_artifact_name: runner-failure-scan-report-${{ github.run_id }}
     secrets: inherit
