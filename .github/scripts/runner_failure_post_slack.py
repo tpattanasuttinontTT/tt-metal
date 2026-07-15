@@ -44,13 +44,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to a completed single-runner report JSON.",
     )
     parser.add_argument(
-        "--scan-report-json",
+        "--triggering-failures-json",
         type=Path,
-        help="Optional scan report JSON containing the triggering runner failures.",
+        help="Optional JSON array of triggering failures from the scan workflow.",
     )
     parser.add_argument(
         "--runner-name",
-        help="Runner/host name to select from --scan-report-json.",
+        help="Runner/host name to use in Slack messages.",
     )
     parser.add_argument(
         "--slack-channel",
@@ -140,25 +140,19 @@ def int_from_report(value: Any, default: int) -> int:
         return default
 
 
-def triggering_results_from_scan_report(
-    scan_report: dict[str, Any] | None, runner_name: str
-) -> list[JobScanResult]:
-    if not scan_report:
+def load_triggering_failures_json(path: Path | None) -> list[JobScanResult]:
+    if path is None:
         return []
 
-    runner_failures = scan_report.get("runner_failures")
-    if not isinstance(runner_failures, dict):
-        return []
-
-    raw_values = runner_failures.get(runner_name)
-    if raw_values is None:
-        for candidate_runner, candidate_values in runner_failures.items():
-            if str(candidate_runner).casefold() == runner_name.casefold():
-                raw_values = candidate_values
-                break
+    try:
+        raw_values = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read triggering failures JSON {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Unable to parse triggering failures JSON {path}: {exc}") from exc
 
     if not isinstance(raw_values, list):
-        return []
+        raise RuntimeError(f"Triggering failures JSON {path} must contain a list.")
 
     return [
         scan_result_from_dict(value)
@@ -474,15 +468,15 @@ def post_runner_report_from_report(
     slack_config: SlackConfig,
     report: dict[str, Any],
     *,
-    scan_report: dict[str, Any] | None = None,
+    triggering_failures: list[JobScanResult] | None = None,
     runner_name_override: str | None = None,
 ) -> None:
     runner_name = str(runner_name_override or report.get("runner_name") or UNKNOWN_RUNNER)
     scan_results = scan_results_from_report(report)
     hours = int_from_report(report.get("hours"), default=24)
     report_failures = [result for result in scan_results if result.signature_labels]
-    triggering_failures = triggering_results_from_scan_report(scan_report, runner_name)
-    summary_failures = triggering_failures or report_failures
+    triggering_results = triggering_failures or []
+    summary_failures = triggering_results or report_failures
 
     if summary_failures:
         parent_text = (
@@ -499,10 +493,10 @@ def post_runner_report_from_report(
         )
 
     thread_ts = post_slack_message(slack_config, parent_text)
-    if triggering_failures:
+    if triggering_results:
         post_slack_message(
             slack_config,
-            format_triggering_jobs_for_slack(runner_name, triggering_failures),
+            format_triggering_jobs_for_slack(runner_name, triggering_results),
             thread_ts=thread_ts,
         )
     post_runner_log_table_for_slack(
@@ -521,15 +515,13 @@ def main() -> int:
         if slack_config is None:
             return 0
         report = load_report_json(args.runner_report_json)
-        scan_report = (
-            load_report_json(args.scan_report_json)
-            if args.scan_report_json is not None
-            else None
+        triggering_failures = load_triggering_failures_json(
+            args.triggering_failures_json
         )
         post_runner_report_from_report(
             slack_config,
             report,
-            scan_report=scan_report,
+            triggering_failures=triggering_failures,
             runner_name_override=args.runner_name,
         )
         return 0

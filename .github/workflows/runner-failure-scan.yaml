@@ -126,7 +126,7 @@ jobs:
         id: runner_matrix
         if: always() && hashFiles('out/runner_failure_report.json') != ''
         run: |
-          runner_matrix="$(jq -c '(.runner_failures // {}) | keys' out/runner_failure_report.json)"
+          runner_matrix="$(jq -c '(.runner_failures // {}) | to_entries | map({runner_name: .key, triggering_failures: .value})' out/runner_failure_report.json)"
           echo "runner_matrix=$runner_matrix" >> "$GITHUB_OUTPUT"
           echo "Runner report matrix: $runner_matrix"
 
@@ -158,12 +158,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner_name: ${{ fromJson(needs.scan.outputs.runner_matrix) }}
+        runner: ${{ fromJson(needs.scan.outputs.runner_matrix) }}
     uses: ./.github/workflows/runner-failure-report.yaml
     with:
-      runner_name: ${{ matrix.runner_name }}
+      runner_name: ${{ matrix.runner.runner_name }}
+      triggering_failures_json: ${{ toJson(matrix.runner.triggering_failures) }}
       hours: ${{ github.event.inputs.hours || '24' }}
       post_to_slack: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event.inputs.post-to-slack == 'true' }}
       slack_channel_id: ${{ github.event.inputs.slack-channel-id || '' }}
-      scan_report_artifact_name: runner-failure-scan-report-${{ github.run_id }}
     secrets: inherit
