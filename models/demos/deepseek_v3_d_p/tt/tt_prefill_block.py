@@ -38,15 +38,6 @@ def get_block_timings() -> dict[int, dict[str, list[float]]]:
     return _BLOCK_TIMINGS
 
 
-# Optional per-layer MLA/MoE Tracy signposts for device-side profiling (TT_PREFILL_BLOCK_SIGNPOST=1).
-# Cheap host markers (NO device sync, unlike the timing gate above) delimiting the MLA vs FFN op regions
-# in the device ops log, so a device-profiler driver can bucket per-op device time into MLA vs MoE. Off by
-# default; tracy is imported only when the gate is set (keeps it off the normal import path).
-_BLOCK_SIGNPOST_ENABLED = os.environ.get("TT_PREFILL_BLOCK_SIGNPOST", "0") == "1"
-if _BLOCK_SIGNPOST_ENABLED:
-    from tracy import signpost
-
-
 # Per-axis CCL topology. A scalar applies to both mesh axes; a 2-tuple (row = SP-axis-0,
 # col = TP-axis-1) configures each axis independently — e.g. (Ring, Linear) for
 # FABRIC_2D_TORUS_Y, where only the SP axis is wrapped into a ring.
@@ -480,8 +471,6 @@ class TtPrefillBlock(LightweightModule):
         if _timing:
             ttnn.synchronize_device(self.mesh_device)
             _t_start = time.perf_counter()
-        if _BLOCK_SIGNPOST_ENABLED:
-            signpost("MLA")  # device-profiler bucket marker: MLA region begins (attn_norm + MLA + residual)
 
         # --- Attention ---
         attn_norm_out = self.attn_norm(x)
@@ -547,8 +536,6 @@ class TtPrefillBlock(LightweightModule):
             kv_intermediates["post_mla_residual"] = ttnn.clone(x)
 
         # --- FFN ---
-        if _BLOCK_SIGNPOST_ENABLED:
-            signpost("MOE")  # device-profiler bucket marker: FFN/MoE region begins (ffn_norm + FFN + residual)
         ffn_norm_out = self.ffn_norm(x)
         if return_kv_intermediates:
             # post_attention_layernorm output (the FFN norm), TP-sharded on hidden.

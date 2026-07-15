@@ -28,7 +28,6 @@ import os
 import statistics
 import time
 from pathlib import Path
-from unittest import mock
 
 import pytest
 import torch
@@ -1120,31 +1119,12 @@ def run_chunked_transformer_no_pcc(
         logger.info("[profile] warmup chunk 0 complete (kernels JITted); measured region begins")
         signpost("PROFILE_MEASURE_START")
 
-    # Device-profiling (TT_PREFILL_BLOCK_SIGNPOST=1): signpost ONLY the last iteration so the profiled
-    # region is one warm pass (all prior iters populated the program cache) — keeps the Tracy device op
-    # count to ~n_chunks*num_layers regardless of num_iters. The per-layer MLA/MOE markers inside come
-    # from TtPrefillBlock. Requires num_iters >= 2 (iter 0 compiles).
-    _signpost_profiling = os.environ.get("TT_PREFILL_BLOCK_SIGNPOST", "0") == "1"
-    # The transformer (esp. MoE) emits far more device profiler zones per readback than the on-device L1
-    # profiler buffer holds; left unflushed it overflows and a dropped ZONE_END mis-pairs with a later
-    # program's marker -> "Start and end marker IDs do not match" TT_FATAL at close_mesh_device. Flush the
-    # buffer every chunk via ttnn.ReadDeviceProfiler (needs TT_METAL_PROFILER_MID_RUN_DUMP=1, which the
-    # device-perf driver sets). getattr: the symbol only exists on a profiler-enabled build, so this is a
-    # no-op on a normal build / when not profiling.
-    _read_device_profiler = getattr(ttnn, "ReadDeviceProfiler", None) if _signpost_profiling else None
-
     profiler.start("tt_forward")
     for it in range(num_iters):
         iter_start = time.time()
-        if _signpost_profiling and it == num_iters - 1:
-            signpost("start")
         chunk_times: list[float] = []
         for c in range(n_chunks):
             kv_actual = c * CHUNK
-            # Per-chunk device-profiler marker (last iter only): lets the driver split the region by chunk
-            # = KV depth (chunk c attends to [0, (c+1)*CHUNK), so prior KV before it = c*CHUNK).
-            if _signpost_profiling and it == num_iters - 1:
-                signpost(f"chunk{c}")
             tt_tokens = ttnn.from_torch(
                 chunk_tok_host[c],
                 device=mesh_device,
@@ -1170,14 +1150,6 @@ def run_chunked_transformer_no_pcc(
             ttnn.synchronize_device(mesh_device)
             ttnn.deallocate(tt_tokens)
             chunk_times.append(time.time() - chunk_start)
-            if _read_device_profiler is not None:
-                _read_device_profiler(mesh_device)  # flush profiler buffer per chunk to avoid overflow
-        if _signpost_profiling and it == num_iters - 1:
-            signpost("stop")
-            # Final flush AFTER "stop": the per-chunk mid-run dumps drain the region incrementally, so the
-            # trailing "stop" marker must be flushed too or post_process_ops_log finds "start" but no "stop".
-            if _read_device_profiler is not None:
-                _read_device_profiler(mesh_device)
         iter_total = time.time() - iter_start
         iteration_chunk_times.append(chunk_times)
         logger.info(f"iter {it} done ({n_chunks} chunks) in {iter_total:.3f} seconds")
@@ -1448,189 +1420,3 @@ def test_glm_prefill_transformer_chunked_no_pcc(
         num_iters,
         routing_use_l1_small_for_semaphores=True,
     )
-
-
-# ---------------------------------------------------------------------------
-# Device-side (Tracy) MLA-vs-MoE profiling for GLM chunked prefill.
-# ---------------------------------------------------------------------------
-# Two-part harness (mirrors sparse_mla/test_sparse_mla_perf.py):
-#   * _impl runs the no-PCC chunked prefill under Tracy with the per-layer MLA/MOE + start/stop signposts
-#     enabled (TT_PREFILL_BLOCK_SIGNPOST=1). Config (layers / chunks / iters) is env-driven so the driver
-#     selects it by variant id alone (no -k quoting). WORKLOAD NOTE: Tracy captures the WHOLE run and its
-#     device ring buffer silently drops ops past op_support_count, so total ops = num_iters*n_chunks*
-#     num_layers*(~30 ops/layer) must stay under the cap. Only the LAST iteration is signposted (the
-#     bucketed region), so use the minimum num_iters=2 (iter 0 compiles) and keep n_chunks small; L78 x 2
-#     chunks x 2 iters is ~9k ops. Do NOT profile the full 11/20-chunk sweep.
-#   * the driver spawns _impl under run_device_profiler, slices the signposted region, buckets each op into
-#     MLA vs MoE by the enclosing signpost, device-collapses across chips (compute=max, collectives=avg),
-#     and prints per-region device-kernel time + per-op tables + a CSV.
-_GLM_PERF_RING_8x4 = pytest.param(
-    (8, 4),
-    {
-        "fabric_config": ttnn.FabricConfig.FABRIC_1D_RING,
-        "fabric_router_config": create_fabric_router_config(max_payload_size=GLM51Config.FABRIC_PAYLOAD_SIZE),
-        "l1_small_size": 512,
-    },
-    2,
-    ttnn.Topology.Ring,
-    marks=pytest.mark.requires_mesh_topology(mesh_shape=(8, 4), topology="mesh-8x4"),
-    id="mesh-8x4",
-)
-
-
-@pytest.mark.parametrize(
-    "mesh_device, device_params, num_links, topology", [_GLM_PERF_RING_8x4], indirect=["mesh_device", "device_params"]
-)
-@pytest.mark.parametrize("variant", ["glm_5_1", "glm_5_2"], indirect=True, ids=["glm51", "glm52"])
-@pytest.mark.skipif(not is_blackhole(), reason="GLM DSA ops (indexer / sparse SDPA) are Blackhole-only")
-@pytest.mark.timeout(0)
-def test_glm_prefill_transformer_chunked_device_perf_impl(
-    variant, config_only, mesh_device, device_params, weight_cache_path, num_links, topology
-):
-    """Inner impl: run under Tracy by the driver below (not directly for perf). Config via env:
-    GLM_PERF_LAYERS (default 10), GLM_PERF_N_CHUNKS (default 2), GLM_PERF_ITERS (default 2, >=2)."""
-    num_layers = int(os.environ.get("GLM_PERF_LAYERS", "10"))
-    n_chunks = int(os.environ.get("GLM_PERF_N_CHUNKS", "2"))
-    num_iters = int(os.environ.get("GLM_PERF_ITERS", "2"))
-    assert num_iters >= 2, "device-perf needs num_iters >= 2 (iter 0 compiles; the last iter is profiled warm)"
-    run_chunked_transformer_no_pcc(
-        variant,
-        config_only,
-        mesh_device,
-        weight_cache_path,
-        num_layers,
-        n_chunks,
-        GateComputeMode.DEVICE_FP32,
-        num_links,
-        topology,
-        num_iters,
-        routing_use_l1_small_for_semaphores=True,
-    )
-
-
-@pytest.mark.skipif(os.environ.get("CI") == "true", reason="perf/Tracy test — run locally")
-@pytest.mark.timeout(0)
-def test_glm_prefill_transformer_chunked_device_perf():
-    """Driver: spawn _impl under the Tracy device profiler, bucket the signposted region into MLA vs MoE
-    device-kernel time, print totals + per-op tables, write a CSV. Config via env (all optional):
-      GLM_PERF_VARIANT   = glm51 | glm52       (default glm51)
-      GLM_PERF_LAYERS     = 1 | 10 | 78 | ...   (default 10; must have a complete TTNN cache)
-      GLM_PERF_N_CHUNKS   = 1 | 2 | ...         (default 2; ISL = N * 5120)
-      GLM_PERF_ITERS      = 2+                  (default 2)
-      GLM_PERF_OP_SUPPORT = device-profiler op cap (default 20000; must cover the WHOLE run)
-    Keep LAYERS*N_CHUNKS*ITERS modest so the run fits the device ring buffer (see the _impl note)."""
-    import pandas as pd
-    from tracy.common import PROFILER_ARTIFACTS_DIR
-    from tracy.process_model_log import run_device_profiler
-
-    from models.tt_transformers.tests.test_utils import merge_device_rows
-    from tests.nightly.sdpa_perf_utils import post_process_ops_log
-
-    variant = os.environ.get("GLM_PERF_VARIANT", "glm51")
-    assert variant in ("glm51", "glm52"), f"GLM_PERF_VARIANT must be glm51|glm52, got {variant!r}"
-    layers = os.environ.get("GLM_PERF_LAYERS", "10")
-    n_chunks = os.environ.get("GLM_PERF_N_CHUNKS", "2")
-    num_iters = os.environ.get("GLM_PERF_ITERS", "2")
-    op_support = int(os.environ.get("GLM_PERF_OP_SUPPORT", "20000"))
-    subdir = f"glm_chunked_device_perf/{variant}"
-
-    # `::_impl -k <variant>` scopes to the impl function, then selects its glm51/glm52 param — a single
-    # token, so no shell quoting. Config passed through env (mock.patch.dict) into the tracy subprocess.
-    command = (
-        "pytest -svv models/demos/deepseek_v3_d_p/tests/test_prefill_transformer_chunked.py"
-        f"::test_glm_prefill_transformer_chunked_device_perf_impl -k {variant}"
-    )
-    with mock.patch.dict(
-        os.environ,
-        {
-            "CI": "false",
-            "TT_PREFILL_BLOCK_SIGNPOST": "1",
-            # Enable mid-run profiler dumps so the impl's per-chunk ttnn.ReadDeviceProfiler flush actually
-            # drains the device buffer (else the MoE-heavy transformer overflows it and the marker pairing
-            # breaks at teardown -> "Start and end marker IDs do not match").
-            "TT_METAL_PROFILER_MID_RUN_DUMP": "1",
-            "GLM_PERF_LAYERS": layers,
-            "GLM_PERF_N_CHUNKS": n_chunks,
-            "GLM_PERF_ITERS": num_iters,
-        },
-    ):
-        run_device_profiler(
-            command, subdir, device_analysis_types=["device_kernel_duration"], op_support_count=op_support
-        )
-
-    dur_col = "DEVICE KERNEL DURATION [ns]"
-    # Region between signpost("start")..("stop") = the last (warm) iteration's device ops, with per-chunk
-    # ("chunk{c}") and per-layer (MLA / MOE) marker rows still interleaved. One row per (op call × chip).
-    region = post_process_ops_log(subdir, has_signposts=True)
-    region[dur_col] = pd.to_numeric(region[dur_col], errors="coerce")
-    ri = region.reset_index(drop=True)
-
-    # Walk the markers in order, tracking the current chunk ("chunk{c}") and region (MLA / MOE). Each
-    # MLA/MOE segment runs to the NEXT marker of ANY kind; device-collapse it independently
-    # (merge_device_rows drops signpost rows + collapses chips: compute=max, collectives=avg) and tag it
-    # with (chunk, region). Chunk c attends to [0, (c+1)*CHUNK), so its prior KV depth = c*CHUNK tokens.
-    markers = [(i, ri.loc[i, "OP CODE"]) for i in ri.index if ri.loc[i, "OP TYPE"] == "signpost"]
-    segs = []
-    cur_chunk = -1
-    for k, (mi, code) in enumerate(markers):
-        if code.startswith("chunk"):
-            cur_chunk = int(code[len("chunk") :])
-            continue
-        if code not in ("MLA", "MOE"):
-            continue
-        end = markers[k + 1][0] if k + 1 < len(markers) else len(ri)
-        seg = merge_device_rows(ri.iloc[mi + 1 : end])
-        if len(seg):
-            seg = seg.copy()
-            seg["region"] = "MLA" if code == "MLA" else "MoE"
-            seg["chunk"] = cur_chunk
-            seg["kv_depth"] = cur_chunk * CHUNK
-            segs.append(seg)
-    assert segs, "no MLA/MoE signpost segments in region — did the impl run with TT_PREFILL_BLOCK_SIGNPOST=1?"
-    allseg = pd.concat(segs, ignore_index=True)
-
-    # Per-(chunk, region) totals: chunk = KV depth. MLA is expected to grow with depth (indexer scoring +
-    # sparse_sdpa valid keys); MoE is depth-independent. NOTE: the KVPE gather is full-cache-width every
-    # chunk (SEQ_CACHE_NOPCC), so the MLA depth-growth here understates a right-sized-cache run.
-    per = allseg.groupby(["chunk", "kv_depth", "region"])[dur_col].sum().unstack("region").fillna(0.0).reset_index()
-    for col in ("MLA", "MoE"):
-        if col not in per.columns:
-            per[col] = 0.0
-    per = per.sort_values("chunk")
-
-    lines = [
-        f"GLM {variant} chunked device-kernel time by chunk (=KV depth), last warm iter, {layers} layers, "
-        f"CHUNK={CHUNK}; device-collapsed (compute=max, collectives=avg):",
-        f"{'chunk':>5}{'kv_depth':>10}{'MLA_ms':>10}{'MoE_ms':>10}{'both_ms':>10}{'MLA%':>7}{'MoE%':>7}",
-        "-" * 59,
-    ]
-    for _, r in per.iterrows():
-        mla_ms, moe_ms = r["MLA"] / 1e6, r["MoE"] / 1e6
-        both = mla_ms + moe_ms
-        lines.append(
-            f"{int(r['chunk']):>5}{int(r['kv_depth']):>10}{mla_ms:>10.3f}{moe_ms:>10.3f}{both:>10.3f}"
-            f"{(100.0 * mla_ms / both if both else 0):>7.1f}{(100.0 * moe_ms / both if both else 0):>7.1f}"
-        )
-    tot_mla, tot_moe = per["MLA"].sum() / 1e6, per["MoE"].sum() / 1e6
-    tot_both = tot_mla + tot_moe
-    lines.append("-" * 59)
-    lines.append(
-        f"{'ALL':>5}{'':>10}{tot_mla:>10.3f}{tot_moe:>10.3f}{tot_both:>10.3f}"
-        f"{(100.0 * tot_mla / tot_both if tot_both else 0):>7.1f}{(100.0 * tot_moe / tot_both if tot_both else 0):>7.1f}"
-    )
-
-    # Per-op detail within each (chunk, region) — the full breakdown goes to the CSV.
-    by = (
-        allseg.groupby(["chunk", "kv_depth", "region", "OP CODE"])[dur_col]
-        .agg(count="count", total_ns="sum", avg_ns="mean")
-        .reset_index()
-        .sort_values(["chunk", "region", "total_ns"], ascending=[True, True, False])
-    )
-    table = "\n".join(lines)
-    logger.info("\n" + table)
-    print("\n" + table)  # full table to stdout even if logging is filtered
-
-    csv_out = PROFILER_ARTIFACTS_DIR / subdir / f"glm_{variant}_mla_vs_moe_{layers}L_{n_chunks}c.csv"
-    csv_out.parent.mkdir(parents=True, exist_ok=True)
-    by.to_csv(csv_out, index=False)
-    logger.info(f"per-op-by-region CSV written to {os.path.abspath(csv_out)}")
