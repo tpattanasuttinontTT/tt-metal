@@ -78,7 +78,7 @@ jobs:
         run: python3 -m pip install PyYAML==6.0.2
 
       - name: Restore previous checked-job state
-        if: github.event.inputs.force-fresh != 'true'
+        if: github.event_name != 'push' && github.event.inputs.force-fresh != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -102,7 +102,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-          FORCE_FRESH: ${{ github.event.inputs.force-fresh == 'true' }}
+          FORCE_FRESH: ${{ github.event_name == 'push' || github.event.inputs.force-fresh == 'true' }}
           HOURS: ${{ github.event.inputs.hours || '24' }}
         run: |
           mkdir -p out
