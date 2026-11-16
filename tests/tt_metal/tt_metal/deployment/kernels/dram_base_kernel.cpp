@@ -280,6 +280,7 @@ static inline DramTestParameters dram_make_params_from_work_item(
     p.transfer_len_mode = job.transfer_len_mode;
     p.skip_writes = job.skip_writes;
     p.skip_reads = job.skip_reads;
+    p.access_mode = job.access_mode;
     return p;
 }
 
@@ -726,10 +727,8 @@ static inline bool run_one_dram_job(
     uint64_t total_compare_wait_ticks = 0u;
     uint64_t total_compare_total_ticks = 0u;
 
-    uint32_t rng_state = p.seed ^ p.pass_index;
-    if (rng_state == 0u) {
-        rng_state = 1u;
-    }
+    DramChunkWalker walker;
+    dram_chunk_walker_init(walker, p);
 
     uint32_t generate_request_tag = sync_mb[MB_GENERATE_START];
     uint32_t ncrisc_request_tag = sync_mb[MB_NCRISC_START];
@@ -741,7 +740,6 @@ static inline bool run_one_dram_job(
     uint32_t generated_slot_word_count[2] = {0u, 0u};
     uint32_t generated_slot_phase[2] = {0u, 0u};
 
-    uint32_t next_offset = 0u;
     uint32_t chunk_index = 0u;
 
     bool have_current = false;
@@ -759,11 +757,10 @@ static inline bool run_one_dram_job(
     dram_pending_diag_init(&pending_diag_ready);
     dram_pending_diag_init(&pending_diag_in_flight);
 
-    if (next_offset < p.total_bytes) {
-        const uint32_t remaining_bytes = p.total_bytes - next_offset;
-        const uint32_t transfer_bytes = dram_choose_transfer_len(p, remaining_bytes, rng_state);
+    if (dram_chunk_walker_has_next(walker)) {
+        const DramChunkStep first_step = dram_chunk_walker_next(walker, p);
 
-        current_chunk = dram_make_chunk_state(next_offset, transfer_bytes, chunk_index, sync_mb);
+        current_chunk = dram_make_chunk_state(first_step.offset, first_step.transfer_bytes, chunk_index, sync_mb);
 
         dram_status_heartbeat(status, DRAM_PROGRESS_STAGE_PREPARE);
         sync_mb[MB_CURRENT_STAGE] = MB_STAGE_PREPARE;
@@ -802,7 +799,6 @@ static inline bool run_one_dram_job(
         const uint64_t prep_t1 = timestamp();
         total_prepare_ticks += (prep_t1 - prep_t0);
 
-        next_offset += transfer_bytes;
         chunk_index++;
         have_current = true;
     }
@@ -853,10 +849,9 @@ static inline bool run_one_dram_job(
 
         have_next = false;
 
-        if (next_offset < p.total_bytes) {
-            const uint32_t remaining_bytes = p.total_bytes - next_offset;
-            const uint32_t transfer_bytes = dram_choose_transfer_len(p, remaining_bytes, rng_state);
-            next_chunk = dram_make_chunk_state(next_offset, transfer_bytes, chunk_index, sync_mb);
+        if (dram_chunk_walker_has_next(walker)) {
+            const DramChunkStep next_step = dram_chunk_walker_next(walker, p);
+            next_chunk = dram_make_chunk_state(next_step.offset, next_step.transfer_bytes, chunk_index, sync_mb);
 
             dram_status_heartbeat(status, DRAM_PROGRESS_STAGE_PREPARE);
             sync_mb[MB_CURRENT_STAGE] = MB_STAGE_PREPARE;
@@ -889,7 +884,6 @@ static inline bool run_one_dram_job(
 
             const uint64_t prep_t1 = timestamp();
             total_prepare_ticks += (prep_t1 - prep_t0);
-            next_offset += transfer_bytes;
             chunk_index++;
             have_next = true;
         }

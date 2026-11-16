@@ -28,6 +28,16 @@ testmismatch = re.compile(
     + " pass=(.*): failures=(.*), first_fail_classified_as=(.*),"
     + " write_failures=(.*), read_failures=(.*), words_checked=(.*) .*"
 )
+# Per-bank NCRISC DRAM bandwidth line emitted by log_bandwidth_summary() in test_dram.cpp.
+testdrambw = re.compile(
+    f"({timeregex}).*Test \| DRAM_BW bdf=(\S+) device_id=(\S+) bank=(\S+) bytes=(\S+) "
+    + "write_gbps=(\S+) read_gbps=(\S+) write_bpc=(\S+) read_bpc=(\S+)"
+)
+# Per-GDDR-module EDC telemetry line emitted by log_edc_counter_summary() in test_dram.cpp.
+testgddredc = re.compile(
+    f"({timeregex}).*Test \| GDDR_EDC bdf=(\S+) device_id=(\S+) module=(\S+) "
+    + "temp_top=(\S+) temp_bottom=(\S+) corr_rd=(\S+) corr_wr=(\S+) uncorr_rd=(\S+) uncorr_wr=(\S+)"
+)
 
 print_logs = True
 
@@ -37,6 +47,10 @@ class TestedBank:
     checked_bytes: int
     write_errors: int
     read_errors: int
+    write_gbps: float = 0.0
+    read_gbps: float = 0.0
+    write_bpc: float = 0.0
+    read_bpc: float = 0.0
 
     def to_dict(self):
         return self.__dict__
@@ -60,6 +74,7 @@ class TestRun:
     errors: list[dict]
     chips: dict[str, TestedChips]
     status: str
+    edc: list[dict]
 
     def to_dict(self):
         return {
@@ -67,6 +82,7 @@ class TestRun:
             "errors": self.errors,
             "status": self.status,
             "chips": {i: self.chips[i].to_dict() for i in self.chips},
+            "edc": self.edc,
         }
 
 
@@ -85,6 +101,8 @@ class EventType(Enum):
     MISMATCH = auto()
     BDF = auto()
     BANKERROR = auto()
+    DRAMBW = auto()
+    GDDREDC = auto()
 
 
 @dataclass
@@ -175,6 +193,47 @@ def parse_bankerror(l: str) -> Optional[Event]:
     return Event(EventType.BANKERROR, extra)
 
 
+def parse_drambw(l: str) -> Optional[Event]:
+    m = testdrambw.match(l)
+    if m is None:
+        return None
+
+    extra = {
+        "bdf": m.group(2),
+        "dev_id": m.group(3),
+        "bank": int(m.group(4)),
+        "bytes": int(m.group(5)),
+        "write_gbps": float(m.group(6)),
+        "read_gbps": float(m.group(7)),
+        "write_bpc": float(m.group(8)),
+        "read_bpc": float(m.group(9)),
+    }
+    # print(f"\tDRAMBW '{extra}'")
+
+    return Event(EventType.DRAMBW, extra)
+
+
+def parse_gddredc(l: str) -> Optional[Event]:
+    m = testgddredc.match(l)
+    if m is None:
+        return None
+
+    extra = {
+        "bdf": m.group(2),
+        "dev_id": m.group(3),
+        "module": int(m.group(4)),
+        "temp_top": float(m.group(5)),
+        "temp_bottom": float(m.group(6)),
+        "corr_rd": int(m.group(7)),
+        "corr_wr": int(m.group(8)),
+        "uncorr_rd": int(m.group(9)),
+        "uncorr_wr": int(m.group(10)),
+    }
+    # print(f"\tGDDREDC '{extra}'")
+
+    return Event(EventType.GDDREDC, extra)
+
+
 def parse_line(l: str, outf: Optional[TextIO]) -> Optional[Event]:
     if print_logs:
         print(f"l: {l}")
@@ -185,6 +244,8 @@ def parse_line(l: str, outf: Optional[TextIO]) -> Optional[Event]:
     parsers = [
         parse_teststart,
         parse_bankerror,
+        parse_drambw,
+        parse_gddredc,
         parse_mismatch,
         parse_testend,
         parse_bdf,
@@ -220,6 +281,7 @@ def parse_evs(evs: list[Event], bdfs: dict[str, str]) -> Iterator[TestRun]:
     test: str = ""
     runs: list[TestRun] = []
     errors: list[dict] = []
+    edc: list[dict] = []
     chips: dict[str, TestedChips] = {}
 
     stresstest = "MeshDispatchFixture.TensixDeploymentEthernet05StressTest"
@@ -236,9 +298,11 @@ def parse_evs(evs: list[Event], bdfs: dict[str, str]) -> Iterator[TestRun]:
         if e.typ == EventType.TESTSTART:
             test = e.extra["name"]
             errors = []
+            edc = []
         elif e.typ == EventType.TESTEND:
-            runs.append(TestRun(test, errors, chips, e.extra["status"]))
+            runs.append(TestRun(test, errors, chips, e.extra["status"], edc))
             errors = []
+            edc = []
             chips = {}
         elif e.typ == EventType.MISMATCH:
             errors.append(e.extra)
@@ -249,6 +313,20 @@ def parse_evs(evs: list[Event], bdfs: dict[str, str]) -> Iterator[TestRun]:
             b = TestedBank(e.extra["checked_bytes"], e.extra["write_err"], e.extra["read_err"])
             chips[e.extra["dev_id"]].banks[e.extra["bank"]] = b
             # print(chips)
+        elif e.typ == EventType.DRAMBW:
+            ensure_chip(e.extra)
+            banks = chips[e.extra["dev_id"]].banks
+            bank = banks.get(e.extra["bank"])
+            if bank is None:
+                bank = TestedBank(e.extra["bytes"], 0, 0)
+                banks[e.extra["bank"]] = bank
+            bank.write_gbps = e.extra["write_gbps"]
+            bank.read_gbps = e.extra["read_gbps"]
+            bank.write_bpc = e.extra["write_bpc"]
+            bank.read_bpc = e.extra["read_bpc"]
+        elif e.typ == EventType.GDDREDC:
+            bdfs[e.extra["dev_id"]] = e.extra["bdf"]
+            edc.append(e.extra)
 
     yield from runs
 
@@ -312,8 +390,80 @@ def print_test_summaries(runs: list[TestRun], bdfs: dict[str, str], outf: TextIO
         print_test_summary(r, bdfs, outf)
 
 
+def print_test_bandwidth_summary(r: TestRun, bdfs: dict[str, str], outf: TextIO = stdout):
+    """Per-controller NCRISC DRAM bandwidth as read/write GB/s (from the DRAM_BW log lines).
+
+    Separate from the PASS/FAIL summary; cells show "<read>/<write>" GB/s, or "-" when no
+    bandwidth was reported for that controller.
+    """
+    header = ["chip id", "bdf"]
+    for i in range(8):
+        header.append(f"D{i}")
+
+    rows = []
+    for d in range(32):
+        if not str(d) in bdfs:
+            continue
+        chip = r.chips.get(str(d))
+        row = [d, bdfs[str(d)]]
+        for i in range(8):
+            bank = chip.banks.get(i) if chip else None
+            if bank is not None and (bank.read_gbps or bank.write_gbps):
+                row.append(f"{bank.read_gbps:.1f}/{bank.write_gbps:.1f}")
+            else:
+                row.append("-")
+        rows.append(row)
+
+    rows.sort(key=lambda x: x[1])
+
+    print(table(f"{shortname(r.name)} bandwidth GB/s (read/write)", header, rows), file=outf)
+
+
+def print_test_bandwidth_summaries(runs: list[TestRun], bdfs: dict[str, str], outf: TextIO = stdout):
+    for r in runs:
+        print_test_bandwidth_summary(r, bdfs, outf)
+
+
+def print_test_edc_summary(r: TestRun, outf: TextIO = stdout):
+    """Per-GDDR-module EDC telemetry as a bordered table, one metric per cell.
+
+    Populated only when the test was run with DRAM_TEST_EDC_CHECK=1 (Blackhole firmware
+    telemetry). Counters are cumulative since reset; corrected saturates at 255.
+    """
+    if not r.edc:
+        return
+
+    header = ["chip id", "bdf", "GDDR", "TempTop", "TempBot", "CorrRd", "CorrWr", "UncorrRd", "UncorrWr"]
+    rows = []
+    for e in r.edc:
+        rows.append(
+            [
+                e["dev_id"],
+                e["bdf"],
+                e["module"],
+                f'{e["temp_top"]:.1f}C',
+                f'{e["temp_bottom"]:.1f}C',
+                e["corr_rd"],
+                e["corr_wr"],
+                e["uncorr_rd"],
+                e["uncorr_wr"],
+            ]
+        )
+
+    rows.sort(key=lambda x: (x[1], int(x[2])))
+
+    print(table(f"{shortname(r.name)} GDDR EDC telemetry", header, rows), file=outf)
+
+
+def print_test_edc_summaries(runs: list[TestRun], bdfs: dict[str, str], outf: TextIO = stdout):
+    for r in runs:
+        print_test_edc_summary(r, outf)
+
+
 def print_results(runs: list[TestRun], bdfs: dict[str, str], outf: TextIO = stdout):
     print_test_summaries(runs, bdfs, outf)
+    print_test_bandwidth_summaries(runs, bdfs, outf)
+    print_test_edc_summaries(runs, bdfs, outf)
     print_summary(runs, outf)
 
 
@@ -364,7 +514,7 @@ async def main():
         print(f"Writing logs to '{logpath}'")
 
     if opts.i:
-        evs = await parse_file(opts.i)
+        evs = await parse_file(opts.i, logf)
     else:
         program = "build/test/tt_metal/unit_tests_deployment"
         args = ["--gtest_filter=*DramDeployment_*"]

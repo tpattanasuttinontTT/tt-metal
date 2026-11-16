@@ -33,6 +33,10 @@ columns = [
     "bank",
     "status",
     "error rate",
+    "write_gbps",
+    "read_gbps",
+    "write_bpc",
+    "read_bpc",
 ] + patterns
 
 
@@ -42,6 +46,10 @@ class Bank:
     total_bytes: int
     passed: bool
     patterns: dict
+    write_gbps: float = 0.0
+    read_gbps: float = 0.0
+    write_bpc: float = 0.0
+    read_bpc: float = 0.0
 
 
 @dataclass
@@ -101,7 +109,16 @@ def process_test(test: dict) -> Test:
         for b, bank in ch["banks"].items():
             pat: dict = extract_errors(test["errors"], c, b)
             errors = bank["read_errors"] + bank["write_errors"]
-            banks[b] = Bank(errors, bank["checked_bytes"], errors == 0, pat)
+            banks[b] = Bank(
+                errors,
+                bank["checked_bytes"],
+                errors == 0,
+                pat,
+                bank.get("write_gbps", 0.0),
+                bank.get("read_gbps", 0.0),
+                bank.get("write_bpc", 0.0),
+                bank.get("read_bpc", 0.0),
+            )
 
         chips[c] = Chip(c, bdf, banks)
 
@@ -123,6 +140,10 @@ def prepare_rows(tests: list[Test]):
                     b,
                     "OK" if bank.passed else "FAIL",
                     f"{error_rate:.2f}ppm" if error_rate else "0",
+                    f"{bank.write_gbps:.2f}",
+                    f"{bank.read_gbps:.2f}",
+                    f"{bank.write_bpc:.2f}",
+                    f"{bank.read_bpc:.2f}",
                 ]
 
                 row += ["FAIL" if bank.patterns.get(p, False) else "OK" for p in patterns]

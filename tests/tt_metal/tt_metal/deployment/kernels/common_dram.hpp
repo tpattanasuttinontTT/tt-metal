@@ -27,6 +27,38 @@ static constexpr uint32_t DRAM_FAILURE_WRITE = 1u;
 static constexpr uint32_t DRAM_FAILURE_READ = 2u;
 
 // -------------------------
+// Chunk access order within a worker's region
+// -------------------------
+// SEQUENTIAL: BRISC visits chunk offsets 0, chunk, 2*chunk, ... in ascending order (default).
+// RANDOM:     BRISC visits every chunk exactly once in a shuffled order, so DRAM addresses jump
+//             around the region. Each individual transfer is still a contiguous burst; only the
+//             order across transfers is randomized. See dram_utils.hpp (DramChunkWalker).
+static constexpr uint32_t DRAM_ACCESS_MODE_SEQUENTIAL = 0u;
+static constexpr uint32_t DRAM_ACCESS_MODE_RANDOM = 1u;
+
+// Effective per-chunk transfer size for the fixed grid random-access mode walks: chunk_bytes clamped
+// by max_burst_len and aligned down to a NOC word (min one NOC word). Shared by host (to size the
+// shuffle buffer) and device (to walk the grid) so both compute the same chunk count.
+static inline uint32_t dram_effective_chunk_bytes(uint32_t chunk_bytes, uint32_t max_burst_len) {
+    uint32_t eff = chunk_bytes;
+    if (max_burst_len != 0u && max_burst_len < eff) {
+        eff = max_burst_len;
+    }
+    eff &= ~(DRAM_TEST_NOC_WORD_BYTES - 1u);
+    if (eff == 0u) {
+        eff = DRAM_TEST_NOC_WORD_BYTES;
+    }
+    return eff;
+}
+
+static inline uint32_t dram_total_chunks(uint32_t total_bytes, uint32_t chunk_eff) {
+    if (chunk_eff == 0u) {
+        return 0u;
+    }
+    return (total_bytes + chunk_eff - 1u) / chunk_eff;
+}
+
+// -------------------------
 // Persistent worker status
 // -------------------------
 static constexpr uint32_t DRAM_PROGRESS_MAGIC = 0x4452414Du;  // "DRAM"
@@ -123,6 +155,7 @@ struct DramTestParameters {
     uint32_t transfer_len_mode;
     uint32_t skip_writes;
     uint32_t skip_reads;
+    uint32_t access_mode;  // DRAM_ACCESS_MODE_SEQUENTIAL | DRAM_ACCESS_MODE_RANDOM
 };
 
 static inline uint64_t dram_test_bank_offset(const DramTestParameters& p) {
@@ -151,6 +184,7 @@ struct DramWorkItem {
     uint32_t transfer_len_mode;
     uint32_t skip_writes;
     uint32_t skip_reads;
+    uint32_t access_mode;  // DRAM_ACCESS_MODE_SEQUENTIAL | DRAM_ACCESS_MODE_RANDOM
 };
 
 // -------------------------
@@ -254,6 +288,7 @@ static inline DramTestParameters dram_make_test_parameters_from_work_item(
     p.transfer_len_mode = job.transfer_len_mode;
     p.skip_writes = job.skip_writes;
     p.skip_reads = job.skip_reads;
+    p.access_mode = job.access_mode;
     return p;
 }
 

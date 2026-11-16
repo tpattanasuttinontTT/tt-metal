@@ -1076,6 +1076,7 @@ DramMultiInstanceSummary run_dram_persistent_jobs_test_verbose(
 
         r.wake_flag_l1_addr = l1_alloc(&alloc, sizeof(uint32_t), 4);
         r.sync_mailbox_l1_addr = l1_alloc(&alloc, kDramSyncMailboxWords * sizeof(uint32_t), 32);
+
         DramJobQueueCtrl ctrl{};
         dram_job_queue_ctrl_init(ctrl, queue_capacity);
 
