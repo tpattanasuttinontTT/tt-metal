@@ -183,6 +183,10 @@ def main():
     with open(inf, "r") as f:
         data = json.load(f)
 
+    # test_runner.py writes {"runs": [...], "edc": [...]}; older versions wrote a bare list of runs.
+    if isinstance(data, dict):
+        data = data["runs"]
+
     tests = [process_test(t) for t in data]
     rows = prepare_rows(tests)
     write_csv(outf, rows, columns)
