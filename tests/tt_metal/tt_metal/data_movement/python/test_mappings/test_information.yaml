@@ -43,20 +43,24 @@ tests:
     memory_type: "dram"
     mechanism: "unicast"
     pattern: "one_to_one"
+    bandwidth_unit: "gbps"
 
   1:
     name: "DRAM Core Locations"
     directory: "dram_unary"
+    bandwidth_unit: "gbps"
     comment: |
       This test appears to be broken. The graph is showing numbers that dont make sense.
 
   2:
     name: "DRAM Channels"
     directory: "dram_unary"
+    bandwidth_unit: "gbps"
 
   3:
     name: "DRAM Directed Ideal"
     directory: "dram_unary"
+    bandwidth_unit: "gbps"
     comment: |
       This test shows the ideal read and write bandwidth when transferring multiple 8KB packets.
       The read bandwidth is what is expected, however write bandwidth is expected to be 64
@@ -252,18 +256,22 @@ tests:
     name: "DRAM Packet Sizes 2.0"
     directory: "dram_unary"
     web_viewer_name: "Packet Sizes"
+    bandwidth_unit: "gbps"
 
   41:
     name: "DRAM Directed Ideal 2.0"
     directory: "dram_unary"
+    bandwidth_unit: "gbps"
 
   42:
     name: "DRAM Core Locations 2.0"
     directory: "dram_unary"
+    bandwidth_unit: "gbps"
 
   43:
     name: "DRAM Channels 2.0"
     directory: "dram_unary"
+    bandwidth_unit: "gbps"
 
   44:
     name: "Loopback Packet Sizes 2.0"

@@ -34,6 +34,7 @@
 #include <array>
 #include <map>
 #include <optional>
+#include <set>
 
 namespace tt::tt_metal {
 
@@ -884,7 +885,6 @@ static uint32_t get_dram_max_chips_from_env(uint32_t available_chips) {
     return static_cast<uint32_t>(value);
 }
 
-[[maybe_unused]]
 static bool get_dram_edc_check_from_env() {
     return get_env_flag("DRAM_TEST_EDC_CHECK", false);
 }
@@ -941,80 +941,38 @@ static DramEdcSnapshot read_edc_snapshot(uint32_t device_id) {
     return snapshot;
 }
 
-// Compares before/after EDC snapshots for one chip, logging per-module temps and corrected-error
-// deltas. Returns true (pass) unless an uncorrectable EDC error is present in the after snapshot;
-// both newly-appeared and pre-existing uncorrectable errors fail. Unavailable telemetry passes.
-static bool check_edc_delta(
-    uint32_t device_id, const DramEdcSnapshot& before, const DramEdcSnapshot& after, std::mutex& summary_mutex) {
-    std::lock_guard<std::mutex> lock(summary_mutex);
-
+// Checks one chip's EDC snapshot. Returns true (pass) unless a GDDR module has its sticky
+// uncorrectable flag set. The counters are cumulative since chip reset, so a set flag may come
+// from an earlier run on the same chip. Unavailable telemetry passes.
+static bool check_edc_uncorrectable(uint32_t device_id, const DramEdcSnapshot& snap) {
     const auto bdf = pci_bdf_for_device_id(device_id);
 
-    if (!after.available) {
+    if (!snap.available) {
         log_info(tt::LogTest, "bdf={} device_id={} EDC telemetry unavailable; skipping EDC check", bdf, device_id);
         return true;
     }
 
     bool pass = true;
-
-    for (const auto& [module, a] : after.modules) {
-        DramEdcModuleCounters b{};
-        const auto it = before.modules.find(module);
-        const bool have_before = (it != before.modules.end());
-        if (have_before) {
-            b = it->second;
-        }
-
-        const uint32_t corr_rd_delta = (a.corr_rd >= b.corr_rd) ? (a.corr_rd - b.corr_rd) : a.corr_rd;
-        const uint32_t corr_wr_delta = (a.corr_wr >= b.corr_wr) ? (a.corr_wr - b.corr_wr) : a.corr_wr;
-
-        log_info(
-            tt::LogTest,
-            "bdf={} device_id={} GDDR_{} temp_top={}C temp_bottom={}C corr_rd+={} corr_wr+={} "
-            "(corrected EDC saturates at 255)",
-            bdf,
-            device_id,
-            module,
-            a.temp_top,
-            a.temp_bottom,
-            corr_rd_delta,
-            corr_wr_delta);
-
-        const bool new_uncorr =
-            (a.uncorr_rd && !(have_before && b.uncorr_rd)) || (a.uncorr_wr && !(have_before && b.uncorr_wr));
-        const bool preexisting_uncorr = have_before && (b.uncorr_rd || b.uncorr_wr);
-
-        if (new_uncorr) {
+    for (const auto& [module, m] : snap.modules) {
+        if (m.uncorr_rd || m.uncorr_wr) {
             log_critical(
                 tt::LogTest,
-                "bdf={} device_id={} GDDR_{} UNCORRECTABLE EDC error detected during test "
+                "bdf={} device_id={} GDDR_{} UNCORRECTABLE EDC error flag set since last chip reset "
                 "(uncorr_rd={} uncorr_wr={})",
                 bdf,
                 device_id,
                 module,
-                a.uncorr_rd ? 1 : 0,
-                a.uncorr_wr ? 1 : 0);
-            pass = false;
-        } else if (preexisting_uncorr) {
-            log_warning(
-                tt::LogTest,
-                "bdf={} device_id={} GDDR_{} pre-existing UNCORRECTABLE EDC error present before test "
-                "(uncorr_rd={} uncorr_wr={}); failing",
-                bdf,
-                device_id,
-                module,
-                a.uncorr_rd ? 1 : 0,
-                a.uncorr_wr ? 1 : 0);
+                m.uncorr_rd ? 1 : 0,
+                m.uncorr_wr ? 1 : 0);
             pass = false;
         }
     }
-
     return pass;
 }
 
-// Prints a consolidated per-(chip, GDDR module) EDC counter table at the end of a test, from the
-// after-snapshots already captured during the per-chip EDC check (DRAM_TEST_EDC_CHECK=1). Counters
-// are cumulative since reset (corr_* saturate at 255); uncorr_* are sticky 0/1 flags.
+// Prints a consolidated per-(chip, GDDR module) EDC counter table from the one-time read taken at
+// the end of the DRAM deployment suite (DRAM_TEST_EDC_CHECK=1). Counters are cumulative since
+// reset (corr_* saturate at 255); uncorr_* are sticky 0/1 flags.
 static void log_edc_counter_summary(const char* test_name, const std::map<uint32_t, DramEdcSnapshot>& snapshots) {
     if (snapshots.empty()) {
         return;
@@ -1072,6 +1030,52 @@ static void log_edc_counter_summary(const char* test_name, const std::map<uint32
         }
     }
 }
+
+// Chips exercised by any DRAM deployment test in this process.
+// The EDC counters are read once every suite is completed
+static std::mutex g_edc_devices_mutex;
+static std::set<uint32_t> g_edc_devices;
+
+static void register_edc_device(uint32_t device_id) {
+    std::lock_guard<std::mutex> lock(g_edc_devices_mutex);
+    g_edc_devices.insert(device_id);
+}
+
+// One-time EDC telemetry read after all tests finish. gtest runs global-environment TearDown after
+// the last test (and after the fixture closes its devices). EDC counters are ARC firmware telemetry
+// read through the UMD cluster, so open Metal devices are not needed. If the process aborts (for
+// example a dispatch timeout), this does not run.
+class DramEdcEnvironment : public ::testing::Environment {
+public:
+    void TearDown() override {
+        if (!get_dram_edc_check_from_env()) {
+            return;
+        }
+
+        std::set<uint32_t> devices;
+        {
+            std::lock_guard<std::mutex> lock(g_edc_devices_mutex);
+            devices = g_edc_devices;
+        }
+        if (devices.empty()) {
+            return;
+        }
+
+        std::map<uint32_t, DramEdcSnapshot> snapshots;
+        bool pass = true;
+        for (const uint32_t device_id : devices) {
+            snapshots[device_id] = read_edc_snapshot(device_id);
+            pass &= check_edc_uncorrectable(device_id, snapshots[device_id]);
+        }
+
+        log_edc_counter_summary("DRAM Deployment Suite", snapshots);
+
+        EXPECT_TRUE(pass) << "Uncorrectable GDDR EDC error flag set on at least one tested chip";
+    }
+};
+
+[[maybe_unused]] static ::testing::Environment* const g_dram_edc_environment =
+    ::testing::AddGlobalTestEnvironment(new DramEdcEnvironment);
 
 static void accumulate_galaxy_summary(DramGalaxySummary& dst, const DramMultiInstanceSummary& run, uint64_t jobs) {
     dst.jobs += jobs;
@@ -1166,7 +1170,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
     const uint32_t chunk_bytes = get_dram_chunk_bytes_from_env(4096u);
     const uint32_t total_bytes_per_controller = get_dram_test_bytes_from_env(DRAM_TEST_BYTES);
     const uint32_t transfer_len_mode = get_dram_transfer_len_mode_from_env();
-    const bool edc_check = get_dram_edc_check_from_env();
     const uint32_t access_mode = dram_access_mode_to_work_item(get_dram_access_mode_from_env());
 
     auto noc_mode = get_dram_noc_mode_from_env();
@@ -1192,7 +1195,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
     std::mutex summary_mutex;
     DramPatternTimingSummary pattern_timing;
     DramBandwidthSummary bandwidth;
-    std::map<uint32_t, DramEdcSnapshot> edc_snapshots;
 
     auto run_one_chip = [&](size_t chip_index) {
         if (g_stop_requested.load()) {
@@ -1206,6 +1208,7 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
 
         const auto& mesh_device = devices_[chip_index];
         const auto device_id = mesh_device->get_device_ids()[0];
+        register_edc_device(device_id);
 
         chip_summary.chips_tested = 1;
 
@@ -1308,11 +1311,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
             jobs_per_core[job.bank_id].push_back(job);
         }
 
-        DramEdcSnapshot edc_before;
-        if (edc_check) {
-            edc_before = read_edc_snapshot(device_id);
-        }
-
         const auto subtest_start = std::chrono::steady_clock::now();
 
         DramMultiInstanceSummary run = run_dram_persistent_jobs_test_verbose(
@@ -1338,17 +1336,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
 
         if (!s.pass) {
             chip_pass = false;
-        }
-
-        if (edc_check) {
-            const DramEdcSnapshot edc_after = read_edc_snapshot(device_id);
-            {
-                std::lock_guard<std::mutex> edc_lock(summary_mutex);
-                edc_snapshots[device_id] = edc_after;
-            }
-            if (!check_edc_delta(device_id, edc_before, edc_after, summary_mutex)) {
-                chip_pass = false;
-            }
         }
 
         {
@@ -1438,8 +1425,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
         galaxy,
         std::chrono::duration_cast<std::chrono::seconds>(galaxy_end - galaxy_start));
 
-    log_edc_counter_summary("Persistent Optimal DRAM Deployment", edc_snapshots);
-
     all_pass &= galaxy.pass;
 
     if (g_watchdog_requested.load()) {
@@ -1475,7 +1460,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequent
     const uint32_t chunk_bytes = get_dram_chunk_bytes_from_env(4096u);
     const uint32_t total_bytes_per_controller = get_dram_test_bytes_from_env(DRAM_TEST_BYTES);
     const uint32_t transfer_len_mode = get_dram_transfer_len_mode_from_env();
-    const bool edc_check = get_dram_edc_check_from_env();
     const uint32_t access_mode = dram_access_mode_to_work_item(get_dram_access_mode_from_env());
 
     auto noc_mode = get_dram_noc_mode_from_env();
@@ -1502,7 +1486,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequent
     std::mutex summary_mutex;
     DramPatternTimingSummary pattern_timing;
     DramBandwidthSummary bandwidth;
-    std::map<uint32_t, DramEdcSnapshot> edc_snapshots;
 
     auto run_one_chip = [&](size_t chip_index) {
         if (g_stop_requested.load()) {
@@ -1516,6 +1499,7 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequent
 
         const auto& mesh_device = devices_[chip_index];
         const auto device_id = mesh_device->get_device_ids()[0];
+        register_edc_device(device_id);
 
         chip_summary.chips_tested = 1;
 
@@ -1560,11 +1544,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequent
 
         const uint64_t covered_bytes = bytes_per_core_base * worker_cores.size();
         const uint64_t remainder_bytes = total_bytes_per_controller - covered_bytes;
-
-        DramEdcSnapshot edc_before;
-        if (edc_check) {
-            edc_before = read_edc_snapshot(device_id);
-        }
 
         const auto full_start = std::chrono::steady_clock::now();
 
@@ -1704,17 +1683,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequent
             }
         }
 
-        if (edc_check) {
-            const DramEdcSnapshot edc_after = read_edc_snapshot(device_id);
-            {
-                std::lock_guard<std::mutex> edc_lock(summary_mutex);
-                edc_snapshots[device_id] = edc_after;
-            }
-            if (!check_edc_delta(device_id, edc_before, edc_after, summary_mutex)) {
-                chip_pass = false;
-            }
-        }
-
         const auto full_end = std::chrono::steady_clock::now();
 
         const auto full_duration_sec = std::chrono::duration_cast<std::chrono::seconds>(full_end - full_start).count();
@@ -1807,8 +1775,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequent
         galaxy,
         std::chrono::duration_cast<std::chrono::seconds>(galaxy_end - galaxy_start));
 
-    log_edc_counter_summary("Persistent All-Workers Single-DRAM Sequential Sweep", edc_snapshots);
-
     all_pass &= galaxy.pass;
 
     if (g_watchdog_requested.load()) {
@@ -1844,7 +1810,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBa
     const uint32_t chunk_bytes = get_dram_chunk_bytes_from_env(4096u);
     const uint32_t total_bytes_per_controller = get_dram_test_bytes_from_env(DRAM_TEST_BYTES);
     const uint32_t transfer_len_mode = get_dram_transfer_len_mode_from_env();
-    const bool edc_check = get_dram_edc_check_from_env();
     const uint32_t access_mode = dram_access_mode_to_work_item(get_dram_access_mode_from_env());
 
     auto noc_mode = get_dram_noc_mode_from_env();
@@ -1871,7 +1836,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBa
     std::mutex summary_mutex;
     DramPatternTimingSummary pattern_timing;
     DramBandwidthSummary bandwidth;
-    std::map<uint32_t, DramEdcSnapshot> edc_snapshots;
 
     auto run_one_chip = [&](size_t chip_index) {
         if (g_stop_requested.load()) {
@@ -1885,6 +1849,7 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBa
 
         const auto& mesh_device = devices_[chip_index];
         const auto device_id = mesh_device->get_device_ids()[0];
+        register_edc_device(device_id);
 
         chip_summary.chips_tested = 1;
 
@@ -2030,11 +1995,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBa
 
         const uint64_t total_jobs_for_chip = job_id - 1u;
 
-        DramEdcSnapshot edc_before;
-        if (edc_check) {
-            edc_before = read_edc_snapshot(device_id);
-        }
-
         const auto start = std::chrono::steady_clock::now();
 
         DramMultiInstanceSummary run = run_dram_persistent_jobs_test_verbose(
@@ -2060,17 +2020,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBa
 
         if (!s.pass) {
             chip_pass = false;
-        }
-
-        if (edc_check) {
-            const DramEdcSnapshot edc_after = read_edc_snapshot(device_id);
-            {
-                std::lock_guard<std::mutex> edc_lock(summary_mutex);
-                edc_snapshots[device_id] = edc_after;
-            }
-            if (!check_edc_delta(device_id, edc_before, edc_after, summary_mutex)) {
-                chip_pass = false;
-            }
         }
 
         if (g_watchdog_requested.load()) {
@@ -2161,8 +2110,6 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBa
         "Persistent Partitioned Workers All-DRAM",
         galaxy,
         std::chrono::duration_cast<std::chrono::seconds>(galaxy_end - galaxy_start));
-
-    log_edc_counter_summary("Persistent Partitioned Workers All-DRAM", edc_snapshots);
 
     all_pass &= galaxy.pass;
 

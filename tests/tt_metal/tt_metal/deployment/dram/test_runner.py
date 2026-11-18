@@ -26,7 +26,7 @@ testmismatch = re.compile(
     f"({timeregex}).*Test \| \[bdf=(.*)\]\[device_id=(.*)\]"
     + " Mismatch on dram_controller=(.*) core (.*) pattern=(.*) repeat=(.*)"
     + " pass=(.*): failures=(.*), first_fail_classified_as=(.*),"
-    + " write_failures=(.*), read_failures=(.*), words_checked=(.*) .*"
+    + " write_failures=(\d+), read_failures=(\d+)(?:, words_checked=(\d+))?"
 )
 # Per-bank NCRISC DRAM bandwidth line emitted by log_bandwidth_summary() in test_dram.cpp.
 testdrambw = re.compile(
@@ -74,7 +74,6 @@ class TestRun:
     errors: list[dict]
     chips: dict[str, TestedChips]
     status: str
-    edc: list[dict]
 
     def to_dict(self):
         return {
@@ -82,17 +81,21 @@ class TestRun:
             "errors": self.errors,
             "status": self.status,
             "chips": {i: self.chips[i].to_dict() for i in self.chips},
-            "edc": self.edc,
         }
 
 
-def runs_to_json(runs: list[TestRun], **kwargs) -> str:
-    return json.dumps([r.to_dict() for r in runs], **kwargs)
+def results_to_dict(runs: list[TestRun], edc: list[dict]) -> dict:
+    """`edc` is the suite-level GDDR EDC read taken once after all tests (DRAM_TEST_EDC_CHECK=1)."""
+    return {"runs": [r.to_dict() for r in runs], "edc": edc}
 
 
-def runs_to_jsonf(fname: str, runs: list[TestRun], **kwargs) -> None:
+def runs_to_json(runs: list[TestRun], edc: list[dict], **kwargs) -> str:
+    return json.dumps(results_to_dict(runs, edc), **kwargs)
+
+
+def runs_to_jsonf(fname: str, runs: list[TestRun], edc: list[dict], **kwargs) -> None:
     with open(fname, "w") as f:
-        json.dump([r.to_dict() for r in runs], f, **kwargs)
+        json.dump(results_to_dict(runs, edc), f, **kwargs)
 
 
 class EventType(Enum):
@@ -154,7 +157,8 @@ def parse_mismatch(l: str) -> Optional[Event]:
         "first_fail_classified_as": m.group(10),
         "write_failures": int(m.group(11)),
         "read_failures": int(m.group(12)),
-        "words_checked": int(m.group(13)),
+        # log_dram_failure() in dram_base.cpp does not print words_checked; keep None when absent.
+        "words_checked": int(m.group(13)) if m.group(13) is not None else None,
     }
     # print(f"\tMISMATCH '{extra}'")
 
@@ -277,11 +281,12 @@ async def parse_logs(inf: asyncio.StreamReader, outf: Optional[TextIO]) -> list[
     return evs
 
 
-def parse_evs(evs: list[Event], bdfs: dict[str, str]) -> Iterator[TestRun]:
+def parse_evs(evs: list[Event], bdfs: dict[str, str], edc: list[dict]) -> Iterator[TestRun]:
+    """Yields one TestRun per gtest test. GDDR EDC lines are suite-level (printed once after the
+    last test), so they are appended to `edc` instead of being attached to a test."""
     test: str = ""
     runs: list[TestRun] = []
     errors: list[dict] = []
-    edc: list[dict] = []
     chips: dict[str, TestedChips] = {}
 
     stresstest = "MeshDispatchFixture.TensixDeploymentEthernet05StressTest"
@@ -298,11 +303,9 @@ def parse_evs(evs: list[Event], bdfs: dict[str, str]) -> Iterator[TestRun]:
         if e.typ == EventType.TESTSTART:
             test = e.extra["name"]
             errors = []
-            edc = []
         elif e.typ == EventType.TESTEND:
-            runs.append(TestRun(test, errors, chips, e.extra["status"], edc))
+            runs.append(TestRun(test, errors, chips, e.extra["status"]))
             errors = []
-            edc = []
             chips = {}
         elif e.typ == EventType.MISMATCH:
             errors.append(e.extra)
@@ -424,18 +427,18 @@ def print_test_bandwidth_summaries(runs: list[TestRun], bdfs: dict[str, str], ou
         print_test_bandwidth_summary(r, bdfs, outf)
 
 
-def print_test_edc_summary(r: TestRun, outf: TextIO = stdout):
+def print_edc_summary(edc: list[dict], outf: TextIO = stdout):
     """Per-GDDR-module EDC telemetry as a bordered table, one metric per cell.
 
-    Populated only when the test was run with DRAM_TEST_EDC_CHECK=1 (Blackhole firmware
-    telemetry). Counters are cumulative since reset; corrected saturates at 255.
+    Read once at the end of the suite, only when run with DRAM_TEST_EDC_CHECK=1 (Blackhole
+    firmware telemetry). Counters are cumulative since reset; corrected saturates at 255.
     """
-    if not r.edc:
+    if not edc:
         return
 
     header = ["chip id", "bdf", "GDDR", "TempTop", "TempBot", "CorrRd", "CorrWr", "UncorrRd", "UncorrWr"]
     rows = []
-    for e in r.edc:
+    for e in edc:
         rows.append(
             [
                 e["dev_id"],
@@ -452,18 +455,13 @@ def print_test_edc_summary(r: TestRun, outf: TextIO = stdout):
 
     rows.sort(key=lambda x: (x[1], int(x[2])))
 
-    print(table(f"{shortname(r.name)} GDDR EDC telemetry", header, rows), file=outf)
+    print(table("GDDR EDC telemetry (end of suite)", header, rows), file=outf)
 
 
-def print_test_edc_summaries(runs: list[TestRun], bdfs: dict[str, str], outf: TextIO = stdout):
-    for r in runs:
-        print_test_edc_summary(r, outf)
-
-
-def print_results(runs: list[TestRun], bdfs: dict[str, str], outf: TextIO = stdout):
+def print_results(runs: list[TestRun], bdfs: dict[str, str], edc: list[dict], outf: TextIO = stdout):
     print_test_summaries(runs, bdfs, outf)
     print_test_bandwidth_summaries(runs, bdfs, outf)
-    print_test_edc_summaries(runs, bdfs, outf)
+    print_edc_summary(edc, outf)
     print_summary(runs, outf)
 
 
@@ -529,18 +527,19 @@ async def main():
 
     # pprint.pp(evs)
     bdfs = {}
-    runs = list(parse_evs(evs, bdfs))
+    edc: list[dict] = []
+    runs = list(parse_evs(evs, bdfs, edc))
     # pprint.pp(runs)
     # pprint.pp(bdfs)
-    # print(runs_to_json(runs, sort_keys=True, indent=4))
+    # print(runs_to_json(runs, edc, sort_keys=True, indent=4))
 
     if not opts.n:
-        print_results(runs, bdfs)
+        print_results(runs, bdfs, edc)
 
     if logf:
-        print_results(runs, bdfs, logf)
+        print_results(runs, bdfs, edc, logf)
 
-    runs_to_jsonf(logfile, runs, sort_keys=True, indent=4)
+    runs_to_jsonf(logfile, runs, edc, sort_keys=True, indent=4)
 
     if logf:
         logf.close()
