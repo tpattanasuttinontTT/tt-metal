@@ -20,7 +20,7 @@ The host monitors each worker core during the test. If a worker core makes no pr
 
 ## Test cases
 
-The gtest names start with `MeshDispatchFixture.DramDeployment_`. All three tests use the same patterns, loop count, and transfer settings. They are different in how they assign worker cores to DRAM banks.
+The gtest names start with `MeshDispatchFixture.DramDeployment_`. All tests use the same patterns, loop count, and transfer settings. The first three are different in how they assign worker cores to DRAM banks. The two data-retention tests leave the data in DRAM for a fixed time before or after they check it.
 
 ### DramDeployment_PersistentOptimalWorkersAllDramBanks
 
@@ -45,6 +45,31 @@ This test divides all worker cores among the DRAM banks. Worker core `n` tests b
 The test divides the test region of each bank among the worker cores of that bank, the same as the sweep test. All banks run at the same time.
 
 Use this test to put load on all banks at the same time, with many worker cores on each bank.
+
+### DramDeployment_DataRetentionWriteSleepRead
+
+This test uses the same worker cores as `DramDeployment_PersistentOptimalWorkersAllDramBanks`: one worker core for each DRAM bank. All banks run at the same time.
+
+For each pass of each pattern, each worker core does these steps:
+
+1. Write the pattern to the full test region of its bank. The test does not read back during this step.
+2. Sleep for `DRAM_TEST_RETENTION_SLEEP_S` seconds. The worker core does not access DRAM during the sleep.
+3. Read the full region and compare it with the expected data.
+
+Use this test to find cells that do not keep their data while DRAM is not accessed.
+
+### DramDeployment_DataRetentionWriteReadSleep
+
+This test is the same as `DramDeployment_DataRetentionWriteSleepRead`, but the sleep comes after the read: write the full region, read and compare the full region, then sleep.
+
+### Notes on the data-retention tests
+
+- The worker core sleeps with a wall-clock wait loop (`riscv_wait`). It updates its heartbeat during the sleep, so the stall watchdog does not stop the test.
+- `DRAM_TEST_RETENTION_SLEEP_S` is a minimum. The wait loop counts AICLK cycles, and the test converts seconds to cycles at the maximum AICLK. AICLK is lower while the worker cores sleep (about 800 MHz on Blackhole), so the real sleep is longer, about 1.7 times the value. The chip summary shows the average real time per sleep.
+- There is one sleep for each pass of each pattern in each loop. The default patterns have 142 passes, so one loop with the default 15 s sleep takes more than 35 minutes (about 60 minutes with the lower idle AICLK). With `DRAM_TEST_FAST=1` there are 5 passes, so one loop takes more than 75 seconds (about 2 minutes).
+- The tests do not show a bandwidth summary, because the write and the read of a region are in different jobs.
+- `test_runner.py` does not run these tests by default. Run them with a gtest filter, for example `--gtest_filter=*DataRetention*`.
+- All other variables (`DRAM_TEST_MBYTES`, `DRAM_TEST_LOOPS`, `DRAM_TEST_FAST`, `DRAM_TEST_MAX_CHIPS`, chunk size, transfer length mode, access mode, and NOC mode) have the same effect as in the other tests. In random access mode, the write and the read of a region use the same seed, so they visit the chunks in the same order.
 
 ## Data patterns
 
@@ -78,7 +103,7 @@ To run the tests and get a summary, use the Python runner:
 python3 tests/tt_metal/tt_metal/deployment/dram/test_runner.py
 ```
 
-The runner starts `build/test/tt_metal/unit_tests_deployment` with `--gtest_filter=*DramDeployment_*`. It reads the log while the test runs. At the end, it shows these tables:
+The runner starts `build/test/tt_metal/unit_tests_deployment` with `--gtest_filter=*DramDeployment_*:-*DataRetention*`, so it does not run the data-retention tests. It reads the log while the test runs. At the end, it shows these tables:
 
 - A PASS or FAIL table for each test, with one row for each chip and one column for each bank.
 - A bandwidth table for each test, with read and write GB/s for each bank.
@@ -119,6 +144,7 @@ All variables are optional. Set them in the shell before you start the test or t
 | `DRAM_TEST_LOOPS` | `1` | Number of times to run the full pattern list. A value of 0, or a value that is not a number, gives 1. Each loop tests the same region again. |
 | `DRAM_TEST_FAST` | off | Set to `1` to run only 4 patterns: Checkerboard, Random, Counter, and Address. |
 | `DRAM_TEST_MAX_CHIPS` | all chips | Number of chips to test. The tests use the first chips in the device list. The value must be from 1 to the number of chips. |
+| `DRAM_TEST_RETENTION_SLEEP_S` | `15` | Data-retention tests only. Minimum number of seconds to sleep between the write and the read (`WriteSleepRead`), or after the read (`WriteReadSleep`). A value of 0 gives no sleep. A value that is not a number gives 15. |
 
 `DRAM_TEST_MBYTES` is the size of one pass on one bank. Each pass of each pattern writes and reads the full region. Each loop does all of the passes again, on the same region. A larger `DRAM_TEST_LOOPS` value does not test more DRAM addresses. It tests the same addresses more times, with a new seed.
 

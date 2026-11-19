@@ -241,6 +241,39 @@ static uint32_t get_dram_test_loops_from_env(uint32_t default_loops = 1u) {
     return static_cast<uint32_t>(value);
 }
 
+// Maximum AICLK in MHz from firmware telemetry. Falls back to `fallback_mhz` if the firmware does not report it.
+static uint32_t get_max_aiclk_mhz(uint32_t device_id, uint32_t fallback_mhz) {
+    auto* tt_device = MetalContext::instance().get_cluster().get_driver()->get_chip(device_id)->get_tt_device();
+    if (tt_device == nullptr) {
+        return fallback_mhz;
+    }
+    auto* fw = tt_device->get_firmware_info_provider();
+    if (fw == nullptr) {
+        return fallback_mhz;
+    }
+    const std::optional<uint32_t> max_mhz = fw->get_max_clock_freq();
+    if (!max_mhz.has_value() || *max_mhz == 0u) {
+        return fallback_mhz;
+    }
+    return std::max(*max_mhz, fallback_mhz);
+}
+
+// Sleep length for the data-retention tests, in seconds. 0 is allowed (no sleep).
+static uint32_t get_dram_retention_sleep_s_from_env(uint32_t default_s = 15u) {
+    const char* env = std::getenv("DRAM_TEST_RETENTION_SLEEP_S");
+    if (!env || env[0] == '\0') {
+        return default_s;
+    }
+
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(env, &end, 0);
+    if (end == env) {
+        return default_s;
+    }
+
+    return static_cast<uint32_t>(value);
+}
+
 static bool pattern_timing_enabled() {
     const char* env = std::getenv("DRAM_TEST_PATTERN_TIMING");
     return env && std::atoi(env);
@@ -1436,6 +1469,320 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
     }
 
     ASSERT_TRUE(all_pass);
+}
+
+// Data-retention order. Each (loop, pattern, pass) runs one write-only job and one read-only job over the
+// whole bank region. The order sets where the sleep goes.
+enum class DramRetentionOrder {
+    WriteSleepRead,  // write -> sleep -> read
+    WriteReadSleep,  // write -> read -> sleep
+};
+
+// Shared body of the data-retention tests. Uses the same layout as
+// DramDeployment_PersistentOptimalWorkersAllDramBanks: one optimally placed worker core per DRAM bank.
+static void run_optimal_workers_retention_test(
+    MeshDispatchFixture* fixture,
+    const std::vector<std::shared_ptr<distributed::MeshDevice>>& devices,
+    const char* test_label,
+    DramRetentionOrder order) {
+    if (g_stop_requested.load()) {
+        GTEST_SKIP() << "Test interrupted by user.";
+    }
+    g_stop_message_printed.store(false);
+    g_watchdog_requested.store(false);
+
+    bool all_pass = true;
+    DramGalaxySummary galaxy{};
+    const auto galaxy_start = std::chrono::steady_clock::now();
+
+    const uint32_t repeats = get_dram_test_loops_from_env(1u);
+    constexpr uint32_t initial_seed = 0x12345678u;
+    constexpr uint32_t advance_seed = 1u;
+
+    const auto& kDeploymentPatterns = get_deployment_patterns_from_env();
+
+    const uint32_t chunk_bytes = get_dram_chunk_bytes_from_env(4096u);
+    const uint32_t total_bytes_per_controller = get_dram_test_bytes_from_env(DRAM_TEST_BYTES);
+    const uint32_t transfer_len_mode = get_dram_transfer_len_mode_from_env();
+    const uint32_t access_mode = dram_access_mode_to_work_item(get_dram_access_mode_from_env());
+    const uint32_t sleep_s = get_dram_retention_sleep_s_from_env(15u);
+
+    auto noc_mode = get_dram_noc_mode_from_env();
+
+    // One sleep per (loop, pattern, pass).
+    uint64_t sleeps_per_chip = 0;
+    for (uint32_t pattern_id : kDeploymentPatterns) {
+        sleeps_per_chip += num_passes_for_pattern(pattern_id);
+    }
+    sleeps_per_chip *= repeats;
+
+    std::signal(SIGINT, handle_sigint);
+    log_blackhole_galaxy_pci_bdfs_once();
+    log_dram_pattern_mode_once();
+    log_dram_access_mode_once();
+    log_info(tt::LogTest, "DRAM_TEST_LOOPS={} (whole workload repeat count)", repeats);
+    log_info(
+        tt::LogTest,
+        "{}: order={} DRAM_TEST_RETENTION_SLEEP_S={} sleeps_per_chip={} minimum_sleep_time={} s",
+        test_label,
+        order == DramRetentionOrder::WriteSleepRead ? "write->sleep->read" : "write->read->sleep",
+        sleep_s,
+        sleeps_per_chip,
+        sleeps_per_chip * sleep_s);
+
+    const uint32_t chips_to_test = get_dram_max_chips_from_env(devices.size());
+
+    log_info(tt::LogTest, "Testing {} of {} available chip(s), parallel execution=YES", chips_to_test, devices.size());
+
+    std::mutex summary_mutex;
+    DramPatternTimingSummary pattern_timing;
+
+    auto run_one_chip = [&](size_t chip_index) {
+        if (g_stop_requested.load()) {
+            return;
+        }
+
+        DramGalaxySummary chip_summary{};
+        DramPatternTimingSummary chip_pattern_timing{};
+
+        const auto& mesh_device = devices[chip_index];
+        const auto device_id = mesh_device->get_device_ids()[0];
+        register_edc_device(device_id);
+
+        chip_summary.chips_tested = 1;
+
+        const auto assignments = get_optimal_dram_bank_worker_assignments(mesh_device, tt_metal::NOC::NOC_0);
+
+        // The device sleep counts wall-clock cycles, which run at AICLK. AICLK drops (about 800 MHz on
+        // Blackhole) while the cores sleep, so convert at the maximum AICLK: the real sleep is then never
+        // shorter than DRAM_TEST_RETENTION_SLEEP_S, and is usually longer.
+        const uint64_t clock_mhz =
+            get_max_aiclk_mhz(device_id, static_cast<uint32_t>(mesh_device->get_clock_rate_mhz()));
+        const uint64_t sleep_cycles = static_cast<uint64_t>(sleep_s) * clock_mhz * 1'000'000ull;
+
+        log_info(
+            tt::LogTest,
+            "bdf={} device_id={} {} uses {} DRAM channels, {} worker cores, minimum sleep={} s ({} cycles at max "
+            "AICLK {} MHz)",
+            pci_bdf_for_device_id(device_id),
+            device_id,
+            test_label,
+            mesh_device->num_dram_channels(),
+            assignments.size(),
+            sleep_s,
+            sleep_cycles,
+            clock_mhz);
+
+        if (verbose) {
+            for (const auto& a : assignments) {
+                log_info(
+                    tt::LogTest,
+                    "bdf={} device_id={} DRAM bank {} assigned to logical worker core ({}, {})",
+                    pci_bdf_for_device_id(device_id),
+                    device_id,
+                    a.bank_id,
+                    a.worker_core.x,
+                    a.worker_core.y);
+            }
+        }
+
+        const uint32_t sleep_cycles_lo = static_cast<uint32_t>(sleep_cycles & 0xFFFFFFFFull);
+        const uint32_t sleep_cycles_hi = static_cast<uint32_t>(sleep_cycles >> 32);
+
+        std::vector<DramWorkItem> jobs;
+        uint32_t job_id = 1u;
+        uint32_t seed = initial_seed;
+        uint64_t pattern_toggle_index = 0;
+
+        for (uint32_t repeat_index = 0; repeat_index < repeats; repeat_index++) {
+            for (uint32_t pattern_id : kDeploymentPatterns) {
+                if (g_stop_requested.load()) {
+                    break;
+                }
+
+                const uint32_t write_noc = resolve_noc(noc_mode, pattern_toggle_index);
+                const uint32_t read_noc = resolve_noc(noc_mode, pattern_toggle_index + 1);
+                const uint32_t num_passes = num_passes_for_pattern(pattern_id);
+
+                for (uint32_t pass_index = 0; pass_index < num_passes; pass_index++) {
+                    for (const auto& assignment : assignments) {
+                        DramWorkItem base{};
+                        base.bank_id = assignment.bank_id;
+                        base.bank_offset_lo = 0u;
+                        base.bank_offset_hi = 0u;
+                        base.total_bytes = total_bytes_per_controller;
+                        base.chunk_bytes = chunk_bytes;
+                        base.pattern_id = pattern_id;
+                        base.seed = seed;
+                        base.pass_index = pass_index;
+                        base.repeat_index = repeat_index;
+                        base.write_noc = write_noc;
+                        base.read_noc = read_noc;
+                        base.max_burst_len = chunk_bytes;
+                        base.transfer_len_mode = transfer_len_mode;
+                        base.access_mode = access_mode;
+
+                        // Write-only job over the whole region.
+                        DramWorkItem write_job = base;
+                        write_job.job_id = job_id++;
+                        write_job.skip_writes = 0u;
+                        write_job.skip_reads = 1u;
+
+                        // Read-only job over the same region, with the same seed and pass, so it
+                        // regenerates the same expected data and checks it.
+                        DramWorkItem read_job = base;
+                        read_job.job_id = job_id++;
+                        read_job.skip_writes = 1u;
+                        read_job.skip_reads = 0u;
+
+                        DramWorkItem& sleeper = (order == DramRetentionOrder::WriteSleepRead) ? write_job : read_job;
+                        sleeper.sleep_after_cycles_lo = sleep_cycles_lo;
+                        sleeper.sleep_after_cycles_hi = sleep_cycles_hi;
+
+                        jobs.push_back(write_job);
+                        jobs.push_back(read_job);
+                    }
+                }
+
+                pattern_toggle_index++;
+            }
+
+            seed += advance_seed;
+        }
+
+        std::vector<CoreCoord> worker_cores;
+        worker_cores.reserve(assignments.size());
+        for (const auto& assignment : assignments) {
+            worker_cores.push_back(assignment.worker_core);
+        }
+
+        // Keep insertion order per core: write, read, write, read, ...
+        std::vector<std::vector<DramWorkItem>> jobs_per_core(assignments.size());
+        for (const auto& job : jobs) {
+            TT_FATAL(
+                job.bank_id < assignments.size(),
+                "Invalid DRAM bank id {} for assignment size {}",
+                job.bank_id,
+                assignments.size());
+            jobs_per_core[job.bank_id].push_back(job);
+        }
+
+        const auto subtest_start = std::chrono::steady_clock::now();
+
+        DramMultiInstanceSummary run = run_dram_persistent_jobs_test_verbose(
+            fixture, mesh_device, worker_cores, jobs_per_core, chunk_bytes, DataMovementProcessor::RISCV_0);
+
+        const auto subtest_end = std::chrono::steady_clock::now();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(subtest_end - subtest_start).count();
+
+        accumulate_galaxy_summary(chip_summary, run, jobs.size());
+        accumulate_pattern_timing_summary(chip_pattern_timing, run);
+        // No bandwidth summary: write-only and read-only jobs each have one tick type at 0,
+        // so per-bank bandwidth would be misleading.
+
+        chip_summary.chips.push_back(make_chip_bank_summary(device_id, assignments.size(), run));
+
+        const auto& s = run.summary;
+        const bool chip_pass = s.pass;
+
+        {
+            std::lock_guard<std::mutex> lock(summary_mutex);
+
+            log_info(
+                tt::LogTest,
+                "=== {} Chip Summary bdf={} device_id={} ===",
+                test_label,
+                pci_bdf_for_device_id(device_id),
+                device_id);
+
+            if (g_watchdog_requested.load()) {
+                log_info(
+                    tt::LogTest,
+                    "bdf={} device_id={} status=ABORTED reason=stall_watchdog",
+                    pci_bdf_for_device_id(device_id),
+                    device_id);
+            }
+
+            string message = fmt::format(
+                "bdf={} device_id={} dram_channels={} workers={} jobs={} time={:.2f} ms checked_bytes={} pass={}",
+                pci_bdf_for_device_id(device_id),
+                device_id,
+                assignments.size(),
+                worker_cores.size(),
+                jobs.size(),
+                elapsed_ms,
+                s.checked_bytes,
+                s.pass ? "YES" : "NO");
+
+            if (s.pass) {
+                log_info(tt::LogTest, "{}", message);
+            } else {
+                log_critical(tt::LogTest, "{}", message);
+            }
+
+            // The host stops at the last read result. In write->read->sleep order, that comes before the
+            // last sleep, so that sleep is not part of elapsed_ms.
+            const uint64_t timed_sleeps = (order == DramRetentionOrder::WriteReadSleep && sleeps_per_chip > 0)
+                                              ? sleeps_per_chip - 1
+                                              : sleeps_per_chip;
+            if (timed_sleeps > 0) {
+                log_info(
+                    tt::LogTest,
+                    "bdf={} device_id={} average time per sleep including I/O={:.2f} s (minimum sleep={} s)",
+                    pci_bdf_for_device_id(device_id),
+                    device_id,
+                    elapsed_ms / 1000.0 / static_cast<double>(timed_sleeps),
+                    sleep_s);
+            }
+
+            merge_galaxy_summary(galaxy, chip_summary);
+            merge_pattern_timing_summary(pattern_timing, chip_pattern_timing);
+            all_pass &= chip_pass;
+        }
+
+        if (g_watchdog_requested.load()) {
+            g_stop_requested.store(true);
+        }
+    };
+
+    run_chips_in_parallel(chips_to_test, run_one_chip);
+
+    const auto galaxy_end = std::chrono::steady_clock::now();
+    log_pattern_timing_summary(
+        test_label, pattern_timing, std::chrono::duration<double, std::milli>(galaxy_end - galaxy_start).count());
+
+    log_info(tt::LogTest, "=== {} Loop Summary ===", test_label);
+    log_info(
+        tt::LogTest,
+        "loops={} total_jobs={} checked_bytes={} pass={}",
+        repeats,
+        galaxy.jobs,
+        galaxy.checked_bytes,
+        galaxy.pass ? "YES" : "NO");
+
+    log_galaxy_summary(test_label, galaxy, std::chrono::duration_cast<std::chrono::seconds>(galaxy_end - galaxy_start));
+
+    all_pass &= galaxy.pass;
+
+    if (g_watchdog_requested.load()) {
+        FAIL() << "Test aborted by stall watchdog.";
+    }
+
+    if (g_stop_requested.load()) {
+        GTEST_SKIP() << "Test interrupted by user.";
+    }
+
+    ASSERT_TRUE(all_pass);
+}
+
+TEST_F(MeshDispatchFixture, DramDeployment_DataRetentionWriteSleepRead) {
+    run_optimal_workers_retention_test(
+        this, devices_, "DRAM Data Retention Write-Sleep-Read", DramRetentionOrder::WriteSleepRead);
+}
+
+TEST_F(MeshDispatchFixture, DramDeployment_DataRetentionWriteReadSleep) {
+    run_optimal_workers_retention_test(
+        this, devices_, "DRAM Data Retention Write-Read-Sleep", DramRetentionOrder::WriteReadSleep);
 }
 
 TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequentialSweep) {

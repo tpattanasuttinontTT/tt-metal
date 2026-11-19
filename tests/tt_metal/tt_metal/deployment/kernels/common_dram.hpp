@@ -77,6 +77,7 @@ static constexpr uint32_t DRAM_PROGRESS_STAGE_VERIFY = 5u;
 static constexpr uint32_t DRAM_PROGRESS_STAGE_REREAD = 6u;
 static constexpr uint32_t DRAM_PROGRESS_STAGE_JOB_DONE = 7u;
 static constexpr uint32_t DRAM_PROGRESS_STAGE_DONE = 8u;
+static constexpr uint32_t DRAM_PROGRESS_STAGE_SLEEP = 9u;
 
 // -------------------------
 // Original single-job result
@@ -185,6 +186,10 @@ struct DramWorkItem {
     uint32_t skip_writes;
     uint32_t skip_reads;
     uint32_t access_mode;  // DRAM_ACCESS_MODE_SEQUENTIAL | DRAM_ACCESS_MODE_RANDOM
+    // Device wall-clock cycles to sleep after the job completes, before it is marked done.
+    // 0 = no sleep. Used by the data-retention tests to leave DRAM unaccessed for a fixed time.
+    uint32_t sleep_after_cycles_lo;
+    uint32_t sleep_after_cycles_hi;
 };
 
 // -------------------------

@@ -247,6 +247,25 @@ static inline void dram_status_heartbeat(volatile CoreProgressStatus* status, ui
 
 static inline bool dram_stop_requested(volatile DramJobQueueCtrl* ctrl) { return ctrl->stop_requested != 0u; }
 
+// Sleep for `cycles` device wall-clock cycles without touching DRAM.
+// riscv_wait takes a uint32_t (about 3 s at 1.35 GHz), so wait in short slices. Each slice bumps the
+// heartbeat so the host stall watchdog (10 s) does not fire, and checks for a stop request.
+static constexpr uint32_t DRAM_SLEEP_SLICE_CYCLES = 1u << 24;  // About 12 ms at 1.35 GHz.
+
+static inline void dram_sleep_cycles(
+    uint64_t cycles, volatile CoreProgressStatus* status, volatile DramJobQueueCtrl* ctrl) {
+    while (cycles != 0u) {
+        if (dram_stop_requested(ctrl)) {
+            return;
+        }
+        dram_status_heartbeat(status, DRAM_PROGRESS_STAGE_SLEEP);
+        const uint32_t slice =
+            (cycles > DRAM_SLEEP_SLICE_CYCLES) ? DRAM_SLEEP_SLICE_CYCLES : static_cast<uint32_t>(cycles);
+        riscv_wait(slice);
+        cycles -= slice;
+    }
+}
+
 static inline uint64_t dram_mb_read_u64(volatile uint32_t* mb, uint32_t lo_idx) {
     const uint64_t lo = mb[lo_idx];
     const uint64_t hi = mb[lo_idx + 1u];
@@ -758,7 +777,7 @@ static inline bool run_one_dram_job(
     dram_pending_diag_init(&pending_diag_in_flight);
 
     if (dram_chunk_walker_has_next(walker)) {
-        const DramChunkStep first_step = dram_chunk_walker_next(walker, p);
+        const DramChunkStep first_step = dram_chunk_walker_get_next(walker, p);
 
         current_chunk = dram_make_chunk_state(first_step.offset, first_step.transfer_bytes, chunk_index, sync_mb);
 
@@ -850,7 +869,7 @@ static inline bool run_one_dram_job(
         have_next = false;
 
         if (dram_chunk_walker_has_next(walker)) {
-            const DramChunkStep next_step = dram_chunk_walker_next(walker, p);
+            const DramChunkStep next_step = dram_chunk_walker_get_next(walker, p);
             next_chunk = dram_make_chunk_state(next_step.offset, next_step.transfer_bytes, chunk_index, sync_mb);
 
             dram_status_heartbeat(status, DRAM_PROGRESS_STAGE_PREPARE);
@@ -1145,6 +1164,14 @@ void kernel_main() {
 
             if (!job_completed) {
                 break;
+            }
+
+            // Optional sleep after the job, before it is marked done. Read the slot before head moves,
+            // because the host can refill the slot after that.
+            const uint64_t sleep_after_cycles =
+                (static_cast<uint64_t>(job.sleep_after_cycles_hi) << 32) | job.sleep_after_cycles_lo;
+            if (sleep_after_cycles != 0u) {
+                dram_sleep_cycles(sleep_after_cycles, status, ctrl);
             }
 
             ctrl->head = head + 1u;

@@ -9,6 +9,7 @@
 #include "noc_parameters.h"
 #include "dev_mem_map.h"
 #include "common_dram.hpp"
+#include "api/debug/assert.h"
 
 static_assert(NOC_WORD_BYTES == DRAM_TEST_NOC_WORD_BYTES, "NOC word size mismatch");
 static_assert(MEM_DRAM_SIZE == DRAM_TEST_MAX_BANK_BYTES, "DRAM size mismatch");
@@ -176,49 +177,51 @@ static inline void dram_chunk_walker_init(DramChunkWalker& w, const DramTestPara
     // Sequential mode starts at the start of the region.
     w.next_offset = 0u;
 
-    // Fixed grid used by random mode. grid_chunk_bytes is chunk_bytes, capped at max_burst_len, then rounded
-    // down to a NOC word (64 bytes, minimum one NOC word). Thus, every full chunk is a valid NOC burst.
-    // The last chunk is smaller than the others when the region is not a multiple of grid_chunk_bytes.
+    // Fixed grid used by random mode. grid_chunk_bytes is chunk_bytes, capped at max_burst_len,
+    // then rounded down to a NOC word
     w.grid_chunk_bytes = dram_effective_chunk_bytes(p.chunk_bytes, p.max_burst_len);
-    // Number of chunks, rounded up. The extra bytes get one more (smaller) chunk.
+    // Number of chunks, rounded up. The last chunk may have less than grid_chunk_bytes
     w.total_chunks = dram_total_chunks(w.total_bytes, w.grid_chunk_bytes);
-    // Random mode starts with no chunks returned and the Feistel input at 0.
     w.emitted = 0u;
     w.perm_cursor = 0u;
     // Smallest even bit count that holds every chunk index, divided into two halves of the same size.
     // The Feistel range is at least total_chunks and less than 4 * total_chunks.
     w.perm_half_width_bits = dram_ceil_log2_even(w.total_chunks) / 2u;
-    // Key from the seed and the pass number, so each pass visits the chunks in a different order.
-    // 0x85EBCA6B is a MurmurHash3 mixing constant. "| 1u" makes sure that the key is never 0.
-    w.perm_key = (p.seed ^ (p.pass_index * 0x85EBCA6Bu)) | 1u;
+    // Permutation key from the seed and the pass number, so each pass visits in a different order.
+    // 0x85EBCA6B is a MurmurHash3 mixing constant.
+    w.perm_key = p.seed ^ (p.pass_index * 0x85EBCA6Bu);
 }
 
 static inline bool dram_chunk_walker_has_next(const DramChunkWalker& w) {
-    // Random mode: continue until every chunk is returned one time.
     if (w.mode == DRAM_ACCESS_MODE_RANDOM) {
+        // Random mode: continue until every chunk is returned one time.
         return w.emitted < w.total_chunks;
+    } else if (w.mode == DRAM_ACCESS_MODE_SEQUENTIAL) {
+        // Sequential mode: continue until the next offset gets to the end of the region.
+        return w.next_offset < w.total_bytes;
+    } else {
+        // Unknown mode. Stop the walk (ASSERT only has an effect when asserts are enabled, for example watcher).
+        ASSERT(false);
+        return false;
     }
-    // Sequential mode: continue until the next offset gets to the end of the region.
-    return w.next_offset < w.total_bytes;
 }
 
-static inline DramChunkStep dram_chunk_walker_next(DramChunkWalker& w, const DramTestParameters& p) {
+static inline DramChunkStep dram_chunk_walker_get_next(DramChunkWalker& w, const DramTestParameters& p) {
     DramChunkStep step{};
 
     if (w.mode == DRAM_ACCESS_MODE_RANDOM) {
         // Shuffle perm_cursor to get a chunk index.
-        uint32_t logical = dram_feistel_permute(w.perm_cursor, w.perm_half_width_bits, w.perm_key);
+        uint32_t chunk_index = dram_feistel_permute(w.perm_cursor, w.perm_half_width_bits, w.perm_key);
         w.perm_cursor++;
-        // The Feistel range can be larger than total_chunks,
-        // so try the next cursor value when the index is out of range
-        // Each index in range comes out exactly one time.
-        while (logical >= w.total_chunks) {
-            logical = dram_feistel_permute(w.perm_cursor, w.perm_half_width_bits, w.perm_key);
+        // Try generating an index until it is within the range of total_chunks
+        // NOTE: Each index in range comes out exactly one time.
+        while (chunk_index >= w.total_chunks) {
+            chunk_index = dram_feistel_permute(w.perm_cursor, w.perm_half_width_bits, w.perm_key);
             w.perm_cursor++;
         }
 
         // Convert the chunk index to a byte offset in the region.
-        const uint32_t offset = logical * w.grid_chunk_bytes;
+        const uint32_t offset = chunk_index * w.grid_chunk_bytes;
         // Each transfer is one full chunk.
         uint32_t transfer_bytes = w.grid_chunk_bytes;
         // Only the last chunk can be cut short at the end of the region.
@@ -231,18 +234,22 @@ static inline DramChunkStep dram_chunk_walker_next(DramChunkWalker& w, const Dra
         w.emitted++;
         // Random mode does not call dram_choose_transfer_len, so the transfer length mode has no effect.
         return step;
+    } else if (w.mode == DRAM_ACCESS_MODE_SEQUENTIAL) {
+        // Sequential mode: bytes from the current position to the end of the region.
+        const uint32_t remaining_bytes = p.total_bytes - w.next_offset;
+        // Size depends on the transfer length mode (0 = fixed, 1 = random, 2 = tile-like).
+        // The size is never more than remaining_bytes. Modes 1 and 2 change rng_state.
+        const uint32_t transfer_bytes = dram_choose_transfer_len(p, remaining_bytes, w.rng_state);
+        step.offset = w.next_offset;
+        step.transfer_bytes = transfer_bytes;
+        // Move forward by the transfer size, so the transfers cover the region with no gaps and no overlaps.
+        w.next_offset += transfer_bytes;
+        return step;
+    } else {
+        // Unknown mode. Return an empty step (ASSERT only has an effect when asserts are enabled, for example watcher).
+        ASSERT(false);
+        return step;
     }
-
-    // Sequential mode: bytes from the current position to the end of the region.
-    const uint32_t remaining_bytes = p.total_bytes - w.next_offset;
-    // Size depends on the transfer length mode (0 = fixed, 1 = random, 2 = tile-like).
-    // The size is never more than remaining_bytes. Modes 1 and 2 change rng_state.
-    const uint32_t transfer_bytes = dram_choose_transfer_len(p, remaining_bytes, w.rng_state);
-    step.offset = w.next_offset;
-    step.transfer_bytes = transfer_bytes;
-    // Move forward by the transfer size, so the transfers cover the region with no gaps and no overlaps.
-    w.next_offset += transfer_bytes;
-    return step;
 }
 
 #endif /* _DRAM_TEST_UTILS_H */
