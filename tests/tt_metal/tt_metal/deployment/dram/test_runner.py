@@ -515,8 +515,7 @@ async def main():
         evs = await parse_file(opts.i, logf)
     else:
         program = "build/test/tt_metal/unit_tests_deployment"
-        # The data-retention tests sleep for minutes, so they are not part of the default run.
-        args = ["--gtest_filter=*DramDeployment_*:-*DataRetention*"]
+        args = ["--gtest_filter=*DramDeployment_*"]
 
         env = os.environ
         if not opts.v:

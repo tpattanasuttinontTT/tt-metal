@@ -33,8 +33,12 @@ static constexpr uint32_t DRAM_FAILURE_READ = 2u;
 // RANDOM:     BRISC visits every chunk exactly once in a shuffled order, so DRAM addresses jump
 //             around the region. Each individual transfer is still a contiguous burst; only the
 //             order across transfers is randomized. See dram_utils.hpp (DramChunkWalker).
+// HAMMER:     BRISC reads hammer_num_chunks fixed chunks, starting at chunk hammer_first_chunk,
+//             again and again (chunk 0, 1, .., n-1, 0, 1, ..) for hammer_num_reads transfers in total.
+//             Used by the data-retention stress reads. Use it only with skip_writes = 1.
 static constexpr uint32_t DRAM_ACCESS_MODE_SEQUENTIAL = 0u;
 static constexpr uint32_t DRAM_ACCESS_MODE_RANDOM = 1u;
+static constexpr uint32_t DRAM_ACCESS_MODE_HAMMER = 2u;
 
 // Effective per-chunk transfer size for the fixed grid random-access mode walks: chunk_bytes clamped
 // by max_burst_len and aligned down to a NOC word (min one NOC word). Shared by host (to size the
@@ -156,7 +160,11 @@ struct DramTestParameters {
     uint32_t transfer_len_mode;
     uint32_t skip_writes;
     uint32_t skip_reads;
-    uint32_t access_mode;  // DRAM_ACCESS_MODE_SEQUENTIAL | DRAM_ACCESS_MODE_RANDOM
+    uint32_t access_mode;  // DRAM_ACCESS_MODE_SEQUENTIAL | DRAM_ACCESS_MODE_RANDOM | DRAM_ACCESS_MODE_HAMMER
+    // DRAM_ACCESS_MODE_HAMMER only (see the mode description above).
+    uint32_t hammer_num_reads;
+    uint32_t hammer_first_chunk;
+    uint32_t hammer_num_chunks;
 };
 
 static inline uint64_t dram_test_bank_offset(const DramTestParameters& p) {
@@ -185,11 +193,16 @@ struct DramWorkItem {
     uint32_t transfer_len_mode;
     uint32_t skip_writes;
     uint32_t skip_reads;
-    uint32_t access_mode;  // DRAM_ACCESS_MODE_SEQUENTIAL | DRAM_ACCESS_MODE_RANDOM
+    uint32_t access_mode;  // DRAM_ACCESS_MODE_SEQUENTIAL | DRAM_ACCESS_MODE_RANDOM | DRAM_ACCESS_MODE_HAMMER
     // Device wall-clock cycles to sleep after the job completes, before it is marked done.
     // 0 = no sleep. Used by the data-retention tests to leave DRAM unaccessed for a fixed time.
     uint32_t sleep_after_cycles_lo;
     uint32_t sleep_after_cycles_hi;
+    // DRAM_ACCESS_MODE_HAMMER only: number of transfers, index of the first chunk (in chunk_bytes
+    // units from the start of the job region), and number of chunks to cycle through.
+    uint32_t hammer_num_reads;
+    uint32_t hammer_first_chunk;
+    uint32_t hammer_num_chunks;
 };
 
 // -------------------------
@@ -294,6 +307,9 @@ static inline DramTestParameters dram_make_test_parameters_from_work_item(
     p.skip_writes = job.skip_writes;
     p.skip_reads = job.skip_reads;
     p.access_mode = job.access_mode;
+    p.hammer_num_reads = job.hammer_num_reads;
+    p.hammer_first_chunk = job.hammer_first_chunk;
+    p.hammer_num_chunks = job.hammer_num_chunks;
     return p;
 }
 

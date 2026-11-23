@@ -274,6 +274,23 @@ static uint32_t get_dram_retention_sleep_s_from_env(uint32_t default_s = 15u) {
     return static_cast<uint32_t>(value);
 }
 
+// Number of stress reads that each worker core does in the read phase of the data-retention tests.
+// 0 or an invalid value gives the default.
+static uint32_t get_dram_retention_num_reads_per_core_from_env(uint32_t default_reads = 20000u) {
+    const char* env = std::getenv("DRAM_TEST_RETENTION_NUM_READS_PER_CORE");
+    if (!env || env[0] == '\0') {
+        return default_reads;
+    }
+
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(env, &end, 0);
+    if (end == env || value == 0ul) {
+        return default_reads;
+    }
+
+    return static_cast<uint32_t>(value);
+}
+
 static bool pattern_timing_enabled() {
     const char* env = std::getenv("DRAM_TEST_PATTERN_TIMING");
     return env && std::atoi(env);
@@ -1471,15 +1488,25 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
     ASSERT_TRUE(all_pass);
 }
 
-// Data-retention order. Each (loop, pattern, pass) runs one write-only job and one read-only job over the
-// whole bank region. The order sets where the sleep goes.
+// Data-retention order. Sets where the sleep goes.
 enum class DramRetentionOrder {
     WriteSleepRead,  // write -> sleep -> read
     WriteReadSleep,  // write -> read -> sleep
 };
 
-// Shared body of the data-retention tests. Uses the same layout as
-// DramDeployment_PersistentOptimalWorkersAllDramBanks: one optimally placed worker core per DRAM bank.
+// Number of contiguous chunks that each worker core reads again and again in the stress reads.
+static constexpr uint32_t kDramRetentionHammerChunksPerCore = 4u;
+
+// Shared body of the data-retention tests. Each (loop, pattern, pass) runs two host phases. The host waits for
+// all cores to finish a phase before it starts the next one, so no core reads a bank before its writer is done.
+//   Write phase: one optimally placed worker core per DRAM bank (the same layout as
+//                DramDeployment_PersistentOptimalWorkersAllDramBanks) writes the whole bank region.
+//   Read phase:  every worker core does DRAM_TEST_RETENTION_NUM_READS_PER_CORE stress reads. Worker core i reads
+//                bank i % num_banks. It cycles through its own 4 contiguous chunks (core j of a bank reads
+//                chunks 4j..4j+3). After its stress reads, the optimal core of each bank reads and checks the
+//                whole bank region, so every written byte is checked.
+// WriteSleepRead puts the sleep after the write job. WriteReadSleep puts it after the last job of each core in
+// the read phase.
 static void run_optimal_workers_retention_test(
     MeshDispatchFixture* fixture,
     const std::vector<std::shared_ptr<distributed::MeshDevice>>& devices,
@@ -1506,6 +1533,7 @@ static void run_optimal_workers_retention_test(
     const uint32_t transfer_len_mode = get_dram_transfer_len_mode_from_env();
     const uint32_t access_mode = dram_access_mode_to_work_item(get_dram_access_mode_from_env());
     const uint32_t sleep_s = get_dram_retention_sleep_s_from_env(15u);
+    const uint32_t num_reads_per_core = get_dram_retention_num_reads_per_core_from_env(20000u);
 
     auto noc_mode = get_dram_noc_mode_from_env();
 
@@ -1529,6 +1557,13 @@ static void run_optimal_workers_retention_test(
         sleep_s,
         sleeps_per_chip,
         sleeps_per_chip * sleep_s);
+    log_info(
+        tt::LogTest,
+        "{}: DRAM_TEST_RETENTION_NUM_READS_PER_CORE={} stress reads per worker core over {} chunks of {} bytes",
+        test_label,
+        num_reads_per_core,
+        kDramRetentionHammerChunksPerCore,
+        chunk_bytes);
 
     const uint32_t chips_to_test = get_dram_max_chips_from_env(devices.size());
 
@@ -1536,6 +1571,8 @@ static void run_optimal_workers_retention_test(
 
     std::mutex summary_mutex;
     DramPatternTimingSummary pattern_timing;
+
+    auto should_stop = []() { return g_stop_requested.load() || g_watchdog_requested.load(); };
 
     auto run_one_chip = [&](size_t chip_index) {
         if (g_stop_requested.load()) {
@@ -1551,7 +1588,64 @@ static void run_optimal_workers_retention_test(
 
         chip_summary.chips_tested = 1;
 
+        // Write phase cores: one optimal worker core per DRAM bank. They also do the full-region verify.
         const auto assignments = get_optimal_dram_bank_worker_assignments(mesh_device, tt_metal::NOC::NOC_0);
+        const uint32_t num_banks = static_cast<uint32_t>(assignments.size());
+        TT_FATAL(num_banks > 0, "No DRAM bank worker assignments found");
+
+        // Read phase cores: every worker core. Bank is assigned round robin: worker i reads bank i % num_banks.
+        const auto all_workers = get_worker_cores_for_deployment(mesh_device.get());
+        TT_FATAL(
+            all_workers.size() >= num_banks,
+            "Need at least one worker per DRAM bank: workers={} banks={}",
+            all_workers.size(),
+            num_banks);
+
+        std::vector<uint32_t> reader_bank(all_workers.size());
+        std::vector<uint32_t> reader_local_idx(all_workers.size());
+        std::vector<uint32_t> readers_per_bank(num_banks, 0u);
+        for (size_t worker_idx = 0; worker_idx < all_workers.size(); worker_idx++) {
+            const uint32_t bank_id = static_cast<uint32_t>(worker_idx % num_banks);
+            reader_bank[worker_idx] = bank_id;
+            reader_local_idx[worker_idx] = readers_per_bank[bank_id]++;
+        }
+        const uint32_t max_readers_per_bank = *std::max_element(readers_per_bank.begin(), readers_per_bank.end());
+
+        // The stress reads use the same fixed chunk grid as the device walker.
+        const uint32_t grid_chunk_bytes = dram_effective_chunk_bytes(chunk_bytes, chunk_bytes);
+        const uint64_t hammer_bytes_per_bank =
+            static_cast<uint64_t>(max_readers_per_bank) * kDramRetentionHammerChunksPerCore * grid_chunk_bytes;
+        TT_FATAL(
+            hammer_bytes_per_bank <= total_bytes_per_controller,
+            "Stress-read chunks do not fit in the bank region: {} readers x {} chunks x {} bytes = {} > {} bytes. "
+            "Increase DRAM_TEST_MBYTES or decrease DRAM_TEST_CHUNK_BYTES.",
+            max_readers_per_bank,
+            kDramRetentionHammerChunksPerCore,
+            grid_chunk_bytes,
+            hammer_bytes_per_bank,
+            total_bytes_per_controller);
+
+        // Writer core of each bank, and the index of the same core in all_workers (it runs the full verify).
+        constexpr size_t kNoWorker = std::numeric_limits<size_t>::max();
+        std::vector<CoreCoord> writer_cores(num_banks);
+        std::vector<size_t> verifier_worker_idx(num_banks, kNoWorker);
+        for (const auto& assignment : assignments) {
+            TT_FATAL(
+                assignment.bank_id < num_banks, "Invalid DRAM bank id {} for {} banks", assignment.bank_id, num_banks);
+            TT_FATAL(
+                verifier_worker_idx[assignment.bank_id] == kNoWorker,
+                "DRAM bank {} has more than one optimal worker",
+                assignment.bank_id);
+            const auto it = std::find(all_workers.begin(), all_workers.end(), assignment.worker_core);
+            TT_FATAL(
+                it != all_workers.end(),
+                "Optimal worker core ({}, {}) for DRAM bank {} is not in the worker grid",
+                assignment.worker_core.x,
+                assignment.worker_core.y,
+                assignment.bank_id);
+            writer_cores[assignment.bank_id] = assignment.worker_core;
+            verifier_worker_idx[assignment.bank_id] = static_cast<size_t>(std::distance(all_workers.begin(), it));
+        }
 
         // The device sleep counts wall-clock cycles, which run at AICLK. AICLK drops (about 800 MHz on
         // Blackhole) while the cores sleep, so convert at the maximum AICLK: the real sleep is then never
@@ -1562,13 +1656,16 @@ static void run_optimal_workers_retention_test(
 
         log_info(
             tt::LogTest,
-            "bdf={} device_id={} {} uses {} DRAM channels, {} worker cores, minimum sleep={} s ({} cycles at max "
-            "AICLK {} MHz)",
+            "bdf={} device_id={} {} uses {} DRAM channels, {} writer cores, {} reader cores ({}-{} per bank), "
+            "minimum sleep={} s ({} cycles at max AICLK {} MHz)",
             pci_bdf_for_device_id(device_id),
             device_id,
             test_label,
             mesh_device->num_dram_channels(),
-            assignments.size(),
+            num_banks,
+            all_workers.size(),
+            *std::min_element(readers_per_bank.begin(), readers_per_bank.end()),
+            max_readers_per_bank,
             sleep_s,
             sleep_cycles,
             clock_mhz);
@@ -1589,14 +1686,51 @@ static void run_optimal_workers_retention_test(
         const uint32_t sleep_cycles_lo = static_cast<uint32_t>(sleep_cycles & 0xFFFFFFFFull);
         const uint32_t sleep_cycles_hi = static_cast<uint32_t>(sleep_cycles >> 32);
 
-        std::vector<DramWorkItem> jobs;
+        DramChipSummary chip_bank_summary{};
+        chip_bank_summary.device_id = device_id;
+        chip_bank_summary.pass = true;
+        chip_bank_summary.banks.resize(num_banks);
+
+        uint64_t total_jobs = 0;
+        double elapsed_ms = 0.0;
+
+        // Runs one phase and adds its results to the chip summaries.
+        auto run_phase = [&](const std::vector<CoreCoord>& cores,
+                             const std::vector<std::vector<DramWorkItem>>& jobs_per_core) {
+            uint64_t phase_jobs = 0;
+            for (const auto& core_jobs : jobs_per_core) {
+                phase_jobs += core_jobs.size();
+            }
+
+            const auto phase_start = std::chrono::steady_clock::now();
+            DramMultiInstanceSummary run = run_dram_persistent_jobs_test_verbose(
+                fixture, mesh_device, cores, jobs_per_core, chunk_bytes, DataMovementProcessor::RISCV_0);
+            const auto phase_end = std::chrono::steady_clock::now();
+            elapsed_ms += std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+
+            accumulate_galaxy_summary(chip_summary, run, phase_jobs);
+            accumulate_pattern_timing_summary(chip_pattern_timing, run);
+            // No bandwidth summary: write-only and read-only jobs each have one tick type at 0,
+            // so per-bank bandwidth would be misleading.
+
+            chip_bank_summary.pass &= run.summary.pass;
+            for (const auto& per_core : run.per_core_results) {
+                const uint32_t bank_id = per_core.result.bank_id;
+                if (bank_id < chip_bank_summary.banks.size()) {
+                    accumulate_bank_summary(chip_bank_summary.banks[bank_id], per_core.result);
+                }
+            }
+
+            total_jobs += phase_jobs;
+        };
+
         uint32_t job_id = 1u;
         uint32_t seed = initial_seed;
         uint64_t pattern_toggle_index = 0;
 
-        for (uint32_t repeat_index = 0; repeat_index < repeats; repeat_index++) {
+        for (uint32_t repeat_index = 0; repeat_index < repeats && !should_stop(); repeat_index++) {
             for (uint32_t pattern_id : kDeploymentPatterns) {
-                if (g_stop_requested.load()) {
+                if (should_stop()) {
                     break;
                 }
 
@@ -1604,44 +1738,83 @@ static void run_optimal_workers_retention_test(
                 const uint32_t read_noc = resolve_noc(noc_mode, pattern_toggle_index + 1);
                 const uint32_t num_passes = num_passes_for_pattern(pattern_id);
 
-                for (uint32_t pass_index = 0; pass_index < num_passes; pass_index++) {
-                    for (const auto& assignment : assignments) {
-                        DramWorkItem base{};
-                        base.bank_id = assignment.bank_id;
-                        base.bank_offset_lo = 0u;
-                        base.bank_offset_hi = 0u;
-                        base.total_bytes = total_bytes_per_controller;
-                        base.chunk_bytes = chunk_bytes;
-                        base.pattern_id = pattern_id;
-                        base.seed = seed;
-                        base.pass_index = pass_index;
-                        base.repeat_index = repeat_index;
-                        base.write_noc = write_noc;
-                        base.read_noc = read_noc;
-                        base.max_burst_len = chunk_bytes;
-                        base.transfer_len_mode = transfer_len_mode;
-                        base.access_mode = access_mode;
+                for (uint32_t pass_index = 0; pass_index < num_passes && !should_stop(); pass_index++) {
+                    // Fields shared by every job of this (loop, pattern, pass). All jobs use the whole bank
+                    // region with the same seed and pass, so the read jobs regenerate the data that the write
+                    // job wrote.
+                    DramWorkItem base{};
+                    base.bank_offset_lo = 0u;
+                    base.bank_offset_hi = 0u;
+                    base.total_bytes = total_bytes_per_controller;
+                    base.chunk_bytes = chunk_bytes;
+                    base.pattern_id = pattern_id;
+                    base.seed = seed;
+                    base.pass_index = pass_index;
+                    base.repeat_index = repeat_index;
+                    base.write_noc = write_noc;
+                    base.read_noc = read_noc;
+                    base.max_burst_len = chunk_bytes;
+                    base.transfer_len_mode = transfer_len_mode;
+                    base.access_mode = access_mode;
 
-                        // Write-only job over the whole region.
+                    // Write phase: one write-only job per bank, on the bank's optimal core.
+                    std::vector<std::vector<DramWorkItem>> write_jobs(num_banks);
+                    for (uint32_t bank_id = 0; bank_id < num_banks; bank_id++) {
                         DramWorkItem write_job = base;
                         write_job.job_id = job_id++;
+                        write_job.bank_id = bank_id;
                         write_job.skip_writes = 0u;
                         write_job.skip_reads = 1u;
-
-                        // Read-only job over the same region, with the same seed and pass, so it
-                        // regenerates the same expected data and checks it.
-                        DramWorkItem read_job = base;
-                        read_job.job_id = job_id++;
-                        read_job.skip_writes = 1u;
-                        read_job.skip_reads = 0u;
-
-                        DramWorkItem& sleeper = (order == DramRetentionOrder::WriteSleepRead) ? write_job : read_job;
-                        sleeper.sleep_after_cycles_lo = sleep_cycles_lo;
-                        sleeper.sleep_after_cycles_hi = sleep_cycles_hi;
-
-                        jobs.push_back(write_job);
-                        jobs.push_back(read_job);
+                        if (order == DramRetentionOrder::WriteSleepRead) {
+                            write_job.sleep_after_cycles_lo = sleep_cycles_lo;
+                            write_job.sleep_after_cycles_hi = sleep_cycles_hi;
+                        }
+                        write_jobs[bank_id].push_back(write_job);
                     }
+
+                    run_phase(writer_cores, write_jobs);
+
+                    if (should_stop()) {
+                        break;
+                    }
+
+                    // Read phase, part 1: stress reads on every worker core.
+                    std::vector<std::vector<DramWorkItem>> read_jobs(all_workers.size());
+                    for (size_t worker_idx = 0; worker_idx < all_workers.size(); worker_idx++) {
+                        DramWorkItem stress_job = base;
+                        stress_job.job_id = job_id++;
+                        stress_job.bank_id = reader_bank[worker_idx];
+                        stress_job.skip_writes = 1u;
+                        stress_job.skip_reads = 0u;
+                        stress_job.access_mode = DRAM_ACCESS_MODE_HAMMER;
+                        stress_job.hammer_num_reads = num_reads_per_core;
+                        stress_job.hammer_first_chunk =
+                            reader_local_idx[worker_idx] * kDramRetentionHammerChunksPerCore;
+                        stress_job.hammer_num_chunks = kDramRetentionHammerChunksPerCore;
+                        read_jobs[worker_idx].push_back(stress_job);
+                    }
+
+                    // Read phase, part 2: full-region read and check of each bank, on the bank's optimal core,
+                    // after that core's stress reads.
+                    for (uint32_t bank_id = 0; bank_id < num_banks; bank_id++) {
+                        DramWorkItem verify_job = base;
+                        verify_job.job_id = job_id++;
+                        verify_job.bank_id = bank_id;
+                        verify_job.skip_writes = 1u;
+                        verify_job.skip_reads = 0u;
+                        read_jobs[verifier_worker_idx[bank_id]].push_back(verify_job);
+                    }
+
+                    // Write-read-sleep: every core sleeps after its last read job. The next write phase starts
+                    // only after all cores have finished their sleep.
+                    if (order == DramRetentionOrder::WriteReadSleep) {
+                        for (auto& core_jobs : read_jobs) {
+                            core_jobs.back().sleep_after_cycles_lo = sleep_cycles_lo;
+                            core_jobs.back().sleep_after_cycles_hi = sleep_cycles_hi;
+                        }
+                    }
+
+                    run_phase(all_workers, read_jobs);
                 }
 
                 pattern_toggle_index++;
@@ -1650,40 +1823,9 @@ static void run_optimal_workers_retention_test(
             seed += advance_seed;
         }
 
-        std::vector<CoreCoord> worker_cores;
-        worker_cores.reserve(assignments.size());
-        for (const auto& assignment : assignments) {
-            worker_cores.push_back(assignment.worker_core);
-        }
+        chip_summary.chips.push_back(chip_bank_summary);
 
-        // Keep insertion order per core: write, read, write, read, ...
-        std::vector<std::vector<DramWorkItem>> jobs_per_core(assignments.size());
-        for (const auto& job : jobs) {
-            TT_FATAL(
-                job.bank_id < assignments.size(),
-                "Invalid DRAM bank id {} for assignment size {}",
-                job.bank_id,
-                assignments.size());
-            jobs_per_core[job.bank_id].push_back(job);
-        }
-
-        const auto subtest_start = std::chrono::steady_clock::now();
-
-        DramMultiInstanceSummary run = run_dram_persistent_jobs_test_verbose(
-            fixture, mesh_device, worker_cores, jobs_per_core, chunk_bytes, DataMovementProcessor::RISCV_0);
-
-        const auto subtest_end = std::chrono::steady_clock::now();
-        const double elapsed_ms = std::chrono::duration<double, std::milli>(subtest_end - subtest_start).count();
-
-        accumulate_galaxy_summary(chip_summary, run, jobs.size());
-        accumulate_pattern_timing_summary(chip_pattern_timing, run);
-        // No bandwidth summary: write-only and read-only jobs each have one tick type at 0,
-        // so per-bank bandwidth would be misleading.
-
-        chip_summary.chips.push_back(make_chip_bank_summary(device_id, assignments.size(), run));
-
-        const auto& s = run.summary;
-        const bool chip_pass = s.pass;
+        const bool chip_pass = chip_bank_summary.pass;
 
         {
             std::lock_guard<std::mutex> lock(summary_mutex);
@@ -1704,34 +1846,33 @@ static void run_optimal_workers_retention_test(
             }
 
             string message = fmt::format(
-                "bdf={} device_id={} dram_channels={} workers={} jobs={} time={:.2f} ms checked_bytes={} pass={}",
+                "bdf={} device_id={} dram_channels={} writers={} readers={} jobs={} time={:.2f} ms checked_bytes={} "
+                "pass={}",
                 pci_bdf_for_device_id(device_id),
                 device_id,
-                assignments.size(),
-                worker_cores.size(),
-                jobs.size(),
+                num_banks,
+                writer_cores.size(),
+                all_workers.size(),
+                total_jobs,
                 elapsed_ms,
-                s.checked_bytes,
-                s.pass ? "YES" : "NO");
+                chip_summary.checked_bytes,
+                chip_pass ? "YES" : "NO");
 
-            if (s.pass) {
+            if (chip_pass) {
                 log_info(tt::LogTest, "{}", message);
             } else {
                 log_critical(tt::LogTest, "{}", message);
             }
 
-            // The host stops at the last read result. In write->read->sleep order, that comes before the
-            // last sleep, so that sleep is not part of elapsed_ms.
-            const uint64_t timed_sleeps = (order == DramRetentionOrder::WriteReadSleep && sleeps_per_chip > 0)
-                                              ? sleeps_per_chip - 1
-                                              : sleeps_per_chip;
-            if (timed_sleeps > 0) {
+            // Every sleep is inside a phase, so elapsed_ms includes all of them. It also includes the program
+            // launch and teardown of each phase.
+            if (sleeps_per_chip > 0) {
                 log_info(
                     tt::LogTest,
                     "bdf={} device_id={} average time per sleep including I/O={:.2f} s (minimum sleep={} s)",
                     pci_bdf_for_device_id(device_id),
                     device_id,
-                    elapsed_ms / 1000.0 / static_cast<double>(timed_sleeps),
+                    elapsed_ms / 1000.0 / static_cast<double>(sleeps_per_chip),
                     sleep_s);
             }
 

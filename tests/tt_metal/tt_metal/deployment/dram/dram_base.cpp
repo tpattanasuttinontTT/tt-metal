@@ -1882,7 +1882,15 @@ DramMultiInstanceSummary run_dram_persistent_jobs_test_verbose(
                     }
                 }
 
-                if ((r.jobs_observed_done == core_jobs.size()) && !r.stop_sent) {
+                // The kernel writes a job's result before its optional sleep_after, and counts the job as
+                // completed only after the sleep. A stop cuts the sleep short, so when the last job sleeps,
+                // wait until the device has counted every job before the host sends the stop.
+                const bool last_job_sleeps =
+                    !core_jobs.empty() &&
+                    ((core_jobs.back().sleep_after_cycles_lo | core_jobs.back().sleep_after_cycles_hi) != 0u);
+                const bool device_jobs_completed = !last_job_sleeps || (status->jobs_completed >= core_jobs.size());
+
+                if ((r.jobs_observed_done == core_jobs.size()) && device_jobs_completed && !r.stop_sent) {
                     write_core_u32(
                         *mesh_device, r.core, r.queue_ctrl_l1_addr + offsetof(DramJobQueueCtrl, stop_requested), 1u);
 

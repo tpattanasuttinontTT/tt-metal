@@ -300,6 +300,9 @@ static inline DramTestParameters dram_make_params_from_work_item(
     p.skip_writes = job.skip_writes;
     p.skip_reads = job.skip_reads;
     p.access_mode = job.access_mode;
+    p.hammer_num_reads = job.hammer_num_reads;
+    p.hammer_first_chunk = job.hammer_first_chunk;
+    p.hammer_num_chunks = job.hammer_num_chunks;
     return p;
 }
 

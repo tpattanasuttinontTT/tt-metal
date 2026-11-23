@@ -162,6 +162,11 @@ struct DramChunkWalker {
     uint32_t perm_cursor;           // Next input to dram_feistel_permute.
     uint32_t perm_half_width_bits;  // Width of each Feistel half, in bits. Shuffle range = 2^(2 * this).
     uint32_t perm_key;              // Feistel key for this job and this pass.
+
+    // Hammer traversal state (also uses grid_chunk_bytes and emitted).
+    uint32_t hammer_num_reads;    // Number of transfers to return.
+    uint32_t hammer_first_chunk;  // Index of the first chunk in the grid.
+    uint32_t hammer_num_chunks;   // Number of chunks to cycle through (at least 1).
 };
 
 static inline void dram_chunk_walker_init(DramChunkWalker& w, const DramTestParameters& p) {
@@ -190,6 +195,11 @@ static inline void dram_chunk_walker_init(DramChunkWalker& w, const DramTestPara
     // Permutation key from the seed and the pass number, so each pass visits in a different order.
     // 0x85EBCA6B is a MurmurHash3 mixing constant.
     w.perm_key = p.seed ^ (p.pass_index * 0x85EBCA6Bu);
+
+    // Hammer mode: cycle through a few fixed grid chunks. The host checks that they are inside the region.
+    w.hammer_num_reads = p.hammer_num_reads;
+    w.hammer_first_chunk = p.hammer_first_chunk;
+    w.hammer_num_chunks = (p.hammer_num_chunks == 0u) ? 1u : p.hammer_num_chunks;
 }
 
 static inline bool dram_chunk_walker_has_next(const DramChunkWalker& w) {
@@ -199,6 +209,9 @@ static inline bool dram_chunk_walker_has_next(const DramChunkWalker& w) {
     } else if (w.mode == DRAM_ACCESS_MODE_SEQUENTIAL) {
         // Sequential mode: continue until the next offset gets to the end of the region.
         return w.next_offset < w.total_bytes;
+    } else if (w.mode == DRAM_ACCESS_MODE_HAMMER) {
+        // Hammer mode: continue until the requested number of transfers is returned.
+        return w.emitted < w.hammer_num_reads;
     } else {
         // Unknown mode. Stop the walk (ASSERT only has an effect when asserts are enabled, for example watcher).
         ASSERT(false);
@@ -244,6 +257,26 @@ static inline DramChunkStep dram_chunk_walker_get_next(DramChunkWalker& w, const
         step.transfer_bytes = transfer_bytes;
         // Move forward by the transfer size, so the transfers cover the region with no gaps and no overlaps.
         w.next_offset += transfer_bytes;
+        return step;
+    } else if (w.mode == DRAM_ACCESS_MODE_HAMMER) {
+        // Hammer mode: chunks first, first+1, .., first+n-1, first, .. on the fixed grid.
+        uint32_t chunk_index = w.hammer_first_chunk + (w.emitted % w.hammer_num_chunks);
+        // The host keeps the chunks inside the region. If one is outside, wrap it so the transfer stays valid.
+        if (chunk_index >= w.total_chunks) {
+            ASSERT(false);
+            chunk_index %= w.total_chunks;
+        }
+        const uint32_t offset = chunk_index * w.grid_chunk_bytes;
+        uint32_t transfer_bytes = w.grid_chunk_bytes;
+        // Only the last chunk of the region can be cut short.
+        if (offset + transfer_bytes > w.total_bytes) {
+            transfer_bytes = w.total_bytes - offset;
+        }
+
+        step.offset = offset;
+        step.transfer_bytes = transfer_bytes;
+        w.emitted++;
+        // Like random mode, hammer mode does not call dram_choose_transfer_len.
         return step;
     } else {
         // Unknown mode. Return an empty step (ASSERT only has an effect when asserts are enabled, for example watcher).
