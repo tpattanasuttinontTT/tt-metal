@@ -1492,7 +1492,27 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentOptimalWorkersAllDramBanks)
 enum class DramRetentionOrder {
     WriteSleepRead,  // write -> sleep -> read
     WriteReadSleep,  // write -> read -> sleep
+    // Single-phase modes for the process-split retention cases in test_runner.py. They run only the write
+    // phase or only the read phase of one cycle (DRAM_TEST_RETENTION_CYCLE), with no device sleep. The
+    // runner does the sleep between processes, so no process has the device open during the sleep.
+    WriteOnly,
+    ReadOnly,
 };
+
+// Index of the one (loop, pattern, pass) cycle that the single-phase retention modes run.
+// Cycles are counted in the order of the full retention test: loops, then patterns, then passes.
+static std::optional<uint64_t> get_dram_retention_cycle_from_env() {
+    const char* env = std::getenv("DRAM_TEST_RETENTION_CYCLE");
+    if (!env || env[0] == '\0') {
+        return std::nullopt;
+    }
+
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(env, &end, 0);
+    TT_FATAL(end != env && *end == '\0', "Invalid DRAM_TEST_RETENTION_CYCLE: {}", env);
+
+    return static_cast<uint64_t>(value);
+}
 
 // Number of contiguous chunks that each worker core reads again and again in the stress reads.
 static constexpr uint32_t kDramRetentionHammerChunksPerCore = 4u;
@@ -1529,7 +1549,24 @@ static void run_optimal_workers_retention_test(
     const auto& kDeploymentPatterns = get_deployment_patterns_from_env();
 
     const uint32_t chunk_bytes = get_dram_chunk_bytes_from_env(4096u);
-    const uint32_t total_bytes_per_controller = get_dram_test_bytes_from_env(DRAM_TEST_BYTES);
+    const uint32_t requested_bytes_per_controller = get_dram_test_bytes_from_env(DRAM_TEST_BYTES);
+
+    // Metal uses the bottom of each DRAM bank (the DRAM barrier word at offset 0, profiler and
+    // dispatch areas). Device open and close write there, so data at offset 0 does not survive from one
+    // process to the next. Start the region at the unreserved base, aligned up to 4 KiB, and reduce the
+    // size if the region would go past the test limit.
+    const uint64_t bank_offset =
+        (static_cast<uint64_t>(MetalContext::instance().hal().get_dev_addr(HalDramMemAddrType::UNRESERVED)) +
+         0xFFFull) &
+        ~0xFFFull;
+    TT_FATAL(
+        bank_offset < DRAM_TEST_EFFECTIVE_MAX_BANK_BYTES,
+        "Unreserved DRAM base {} is past the test limit",
+        bank_offset);
+    const uint32_t total_bytes_per_controller = static_cast<uint32_t>(
+        std::min<uint64_t>(requested_bytes_per_controller, DRAM_TEST_EFFECTIVE_MAX_BANK_BYTES - bank_offset) &
+        ~static_cast<uint64_t>(DRAM_TEST_NOC_WORD_BYTES - 1u));
+
     const uint32_t transfer_len_mode = get_dram_transfer_len_mode_from_env();
     const uint32_t access_mode = dram_access_mode_to_work_item(get_dram_access_mode_from_env());
     const uint32_t sleep_s = get_dram_retention_sleep_s_from_env(15u);
@@ -1544,19 +1581,58 @@ static void run_optimal_workers_retention_test(
     }
     sleeps_per_chip *= repeats;
 
+    // Single-phase modes run one cycle and do not sleep on the device.
+    const bool single_phase = (order == DramRetentionOrder::WriteOnly || order == DramRetentionOrder::ReadOnly);
+    const bool device_sleeps = !single_phase;
+    uint64_t selected_cycle = 0;
+    if (single_phase) {
+        const auto cycle = get_dram_retention_cycle_from_env();
+        if (!cycle.has_value()) {
+            GTEST_SKIP() << "Set DRAM_TEST_RETENTION_CYCLE to run this test. test_runner.py does this.";
+        }
+        selected_cycle = *cycle;
+        if (selected_cycle >= sleeps_per_chip) {
+            FAIL() << "DRAM_TEST_RETENTION_CYCLE=" << selected_cycle << " is out of range (" << sleeps_per_chip
+                   << " cycles)";
+        }
+    }
+
     std::signal(SIGINT, handle_sigint);
     log_blackhole_galaxy_pci_bdfs_once();
     log_dram_pattern_mode_once();
     log_dram_access_mode_once();
     log_info(tt::LogTest, "DRAM_TEST_LOOPS={} (whole workload repeat count)", repeats);
-    log_info(
-        tt::LogTest,
-        "{}: order={} DRAM_TEST_RETENTION_SLEEP_S={} sleeps_per_chip={} minimum_sleep_time={} s",
-        test_label,
-        order == DramRetentionOrder::WriteSleepRead ? "write->sleep->read" : "write->read->sleep",
-        sleep_s,
-        sleeps_per_chip,
-        sleeps_per_chip * sleep_s);
+    if (single_phase) {
+        // test_runner.py reads this line to find the number of cycles.
+        uint64_t cycle_index = 0;
+        for (uint32_t repeat_index = 0; repeat_index < repeats; repeat_index++) {
+            for (uint32_t pattern_id : kDeploymentPatterns) {
+                for (uint32_t pass_index = 0; pass_index < num_passes_for_pattern(pattern_id); pass_index++) {
+                    if (cycle_index == selected_cycle) {
+                        log_info(
+                            tt::LogTest,
+                            "RETENTION_CYCLE phase={} index={} total={} loop={} pattern={} pass={}",
+                            order == DramRetentionOrder::WriteOnly ? "write" : "read",
+                            cycle_index,
+                            sleeps_per_chip,
+                            repeat_index,
+                            pattern_name(pattern_id),
+                            pass_index);
+                    }
+                    cycle_index++;
+                }
+            }
+        }
+    } else {
+        log_info(
+            tt::LogTest,
+            "{}: order={} DRAM_TEST_RETENTION_SLEEP_S={} sleeps_per_chip={} minimum_sleep_time={} s",
+            test_label,
+            order == DramRetentionOrder::WriteSleepRead ? "write->sleep->read" : "write->read->sleep",
+            sleep_s,
+            sleeps_per_chip,
+            sleeps_per_chip * sleep_s);
+    }
     log_info(
         tt::LogTest,
         "{}: DRAM_TEST_RETENTION_NUM_READS_PER_CORE={} stress reads per worker core over {} chunks of {} bytes",
@@ -1564,6 +1640,12 @@ static void run_optimal_workers_retention_test(
         num_reads_per_core,
         kDramRetentionHammerChunksPerCore,
         chunk_bytes);
+    log_info(
+        tt::LogTest,
+        "{}: region per bank starts at offset 0x{:x} (metal unreserved DRAM base), size {} bytes",
+        test_label,
+        bank_offset,
+        total_bytes_per_controller);
 
     const uint32_t chips_to_test = get_dram_max_chips_from_env(devices.size());
 
@@ -1649,10 +1731,11 @@ static void run_optimal_workers_retention_test(
 
         // The device sleep counts wall-clock cycles, which run at AICLK. AICLK drops (about 800 MHz on
         // Blackhole) while the cores sleep, so convert at the maximum AICLK: the real sleep is then never
-        // shorter than DRAM_TEST_RETENTION_SLEEP_S, and is usually longer.
+        // shorter than DRAM_TEST_RETENTION_SLEEP_S, and is usually longer. The single-phase modes do not
+        // sleep on the device.
         const uint64_t clock_mhz =
             get_max_aiclk_mhz(device_id, static_cast<uint32_t>(mesh_device->get_clock_rate_mhz()));
-        const uint64_t sleep_cycles = static_cast<uint64_t>(sleep_s) * clock_mhz * 1'000'000ull;
+        const uint64_t sleep_cycles = device_sleeps ? static_cast<uint64_t>(sleep_s) * clock_mhz * 1'000'000ull : 0ull;
 
         log_info(
             tt::LogTest,
@@ -1727,6 +1810,9 @@ static void run_optimal_workers_retention_test(
         uint32_t job_id = 1u;
         uint32_t seed = initial_seed;
         uint64_t pattern_toggle_index = 0;
+        // The single-phase modes walk every cycle so the seed and NOC selection match the full test,
+        // but run only the selected one.
+        uint64_t cycle_index = 0;
 
         for (uint32_t repeat_index = 0; repeat_index < repeats && !should_stop(); repeat_index++) {
             for (uint32_t pattern_id : kDeploymentPatterns) {
@@ -1739,12 +1825,17 @@ static void run_optimal_workers_retention_test(
                 const uint32_t num_passes = num_passes_for_pattern(pattern_id);
 
                 for (uint32_t pass_index = 0; pass_index < num_passes && !should_stop(); pass_index++) {
+                    const uint64_t this_cycle = cycle_index++;
+                    if (single_phase && this_cycle != selected_cycle) {
+                        continue;
+                    }
+
                     // Fields shared by every job of this (loop, pattern, pass). All jobs use the whole bank
                     // region with the same seed and pass, so the read jobs regenerate the data that the write
                     // job wrote.
                     DramWorkItem base{};
-                    base.bank_offset_lo = 0u;
-                    base.bank_offset_hi = 0u;
+                    base.bank_offset_lo = static_cast<uint32_t>(bank_offset & 0xFFFFFFFFull);
+                    base.bank_offset_hi = static_cast<uint32_t>(bank_offset >> 32);
                     base.total_bytes = total_bytes_per_controller;
                     base.chunk_bytes = chunk_bytes;
                     base.pattern_id = pattern_id;
@@ -1758,24 +1849,26 @@ static void run_optimal_workers_retention_test(
                     base.access_mode = access_mode;
 
                     // Write phase: one write-only job per bank, on the bank's optimal core.
-                    std::vector<std::vector<DramWorkItem>> write_jobs(num_banks);
-                    for (uint32_t bank_id = 0; bank_id < num_banks; bank_id++) {
-                        DramWorkItem write_job = base;
-                        write_job.job_id = job_id++;
-                        write_job.bank_id = bank_id;
-                        write_job.skip_writes = 0u;
-                        write_job.skip_reads = 1u;
-                        if (order == DramRetentionOrder::WriteSleepRead) {
-                            write_job.sleep_after_cycles_lo = sleep_cycles_lo;
-                            write_job.sleep_after_cycles_hi = sleep_cycles_hi;
+                    if (order != DramRetentionOrder::ReadOnly) {
+                        std::vector<std::vector<DramWorkItem>> write_jobs(num_banks);
+                        for (uint32_t bank_id = 0; bank_id < num_banks; bank_id++) {
+                            DramWorkItem write_job = base;
+                            write_job.job_id = job_id++;
+                            write_job.bank_id = bank_id;
+                            write_job.skip_writes = 0u;
+                            write_job.skip_reads = 1u;
+                            if (order == DramRetentionOrder::WriteSleepRead) {
+                                write_job.sleep_after_cycles_lo = sleep_cycles_lo;
+                                write_job.sleep_after_cycles_hi = sleep_cycles_hi;
+                            }
+                            write_jobs[bank_id].push_back(write_job);
                         }
-                        write_jobs[bank_id].push_back(write_job);
+
+                        run_phase(writer_cores, write_jobs);
                     }
 
-                    run_phase(writer_cores, write_jobs);
-
-                    if (should_stop()) {
-                        break;
+                    if (order == DramRetentionOrder::WriteOnly || should_stop()) {
+                        continue;
                     }
 
                     // Read phase, part 1: stress reads on every worker core.
@@ -1866,7 +1959,7 @@ static void run_optimal_workers_retention_test(
 
             // Every sleep is inside a phase, so elapsed_ms includes all of them. It also includes the program
             // launch and teardown of each phase.
-            if (sleeps_per_chip > 0) {
+            if (device_sleeps && sleeps_per_chip > 0) {
                 log_info(
                     tt::LogTest,
                     "bdf={} device_id={} average time per sleep including I/O={:.2f} s (minimum sleep={} s)",
@@ -1924,6 +2017,18 @@ TEST_F(MeshDispatchFixture, DramDeployment_DataRetentionWriteSleepRead) {
 TEST_F(MeshDispatchFixture, DramDeployment_DataRetentionWriteReadSleep) {
     run_optimal_workers_retention_test(
         this, devices_, "DRAM Data Retention Write-Read-Sleep", DramRetentionOrder::WriteReadSleep);
+}
+
+// Process-split retention phases, driven by test_runner.py. Each runs one phase of the cycle that
+// DRAM_TEST_RETENTION_CYCLE selects, and skips when that variable is not set. Keep RetentionPhaseWrite
+// before RetentionPhaseRead: gtest runs them in this order, so one process with both filters does
+// write -> read.
+TEST_F(MeshDispatchFixture, DramDeployment_RetentionPhaseWrite) {
+    run_optimal_workers_retention_test(this, devices_, "DRAM Retention Phase Write", DramRetentionOrder::WriteOnly);
+}
+
+TEST_F(MeshDispatchFixture, DramDeployment_RetentionPhaseRead) {
+    run_optimal_workers_retention_test(this, devices_, "DRAM Retention Phase Read", DramRetentionOrder::ReadOnly);
 }
 
 TEST_F(MeshDispatchFixture, DramDeployment_PersistentAllWorkersSingleDramSequentialSweep) {

@@ -61,6 +61,19 @@ Use this test to find cells that do not keep their data while DRAM is not access
 
 This test is the same as `DramDeployment_DataRetentionWriteSleepRead`, but the sleep comes after the read phase. In the write phase, the worker cores do not sleep. In the read phase, each worker core sleeps after its last read job. The next write phase starts only after all worker cores have finished their sleep.
 
+### Process-split data-retention cases (test_runner.py)
+
+In the two tests above, the test process keeps the device open during the sleep. `test_runner.py` also runs two process-split cases, in which no process has the device open during the sleep:
+
+- `RetentionSplitWriteSleepRead`: a write process writes the region and stops. The runner sleeps for `DRAM_TEST_RETENTION_SLEEP_S` seconds. Then a new read process does the stress reads and the full check.
+- `RetentionSplitWriteReadSleep`: one process writes, then reads (stress reads and full check), and stops. The runner sleeps for `DRAM_TEST_RETENTION_SLEEP_S` seconds before the next cycle. The runner does not sleep after the last cycle.
+
+A cycle is one pass of one pattern in one loop, in the same order as the tests above. There is one cycle for each sleep of the tests above. Each process runs one phase of one cycle with the gtests `DramDeployment_RetentionPhaseWrite` and `DramDeployment_RetentionPhaseRead`. The runner selects the cycle with `DRAM_TEST_RETENTION_CYCLE`. Without this variable, these two gtests are skipped. The worker cores do not sleep in these gtests.
+
+The runner shows one result for each case. If a process does not complete its tests (for example, after a watchdog exit), the runner stops that case and shows it as `FAILED`.
+
+Each process opens and closes the device, so the process-split cases take longer than the tests above.
+
 ### Notes on the data-retention tests
 
 - The worker core sleeps with a wall-clock wait loop (`riscv_wait`). It updates its heartbeat during the sleep, so the stall watchdog does not stop the test.
@@ -69,7 +82,8 @@ This test is the same as `DramDeployment_DataRetentionWriteSleepRead`, but the s
 - The chip summary time includes all sleeps, and the start and stop of the program for each phase.
 - The 4 chunks of all worker cores of a bank must fit in the test region: `4 × <worker cores for each bank> × DRAM_TEST_CHUNK_BYTES` must not be more than `DRAM_TEST_MBYTES`. If they do not fit, the test stops with an error.
 - The tests do not show a bandwidth summary, because the write and the read of a region are in different jobs.
-- `test_runner.py` runs these tests by default. They take a long time (see above). To run only them, start the binary with `--gtest_filter=*DataRetention*`. To skip them, use `--gtest_filter=*DramDeployment_*:-*DataRetention*`.
+- The test region of each bank starts at the unreserved DRAM base of metal (about 5.6 MiB on Blackhole), aligned up to 4 KiB, not at offset 0. Metal writes to the bottom of each bank (for example, the DRAM barrier word at offset 0) when it opens and closes the device. If the region does not fit below the test limit, the test makes it smaller. The other tests start at offset 0.
+- `test_runner.py` runs the process-split cases, not the two in-process tests. To run the in-process tests, start the binary with `--gtest_filter=*DataRetention*`.
 - All other variables (`DRAM_TEST_MBYTES`, `DRAM_TEST_LOOPS`, `DRAM_TEST_FAST`, `DRAM_TEST_MAX_CHIPS`, chunk size, transfer length mode, access mode, and NOC mode) have the same effect as in the other tests. In random access mode, the write and the full check of a region use the same seed, so they visit the chunks in the same order. The access mode and the transfer length mode have no effect on the stress reads. Each stress read is one full chunk.
 
 ## Data patterns
@@ -104,7 +118,7 @@ To run the tests and get a summary, use the Python runner:
 python3 tests/tt_metal/tt_metal/deployment/dram/test_runner.py
 ```
 
-The runner starts `build/test/tt_metal/unit_tests_deployment` with `--gtest_filter=*DramDeployment_*`, so it also runs the data-retention tests. It reads the log while the test runs. At the end, it shows these tables:
+The runner starts `build/test/tt_metal/unit_tests_deployment` with `--gtest_filter=*DramDeployment_*:-*DataRetention*:*RetentionPhase*`. Then it runs the [process-split data-retention cases](#process-split-data-retention-cases-test_runnerpy), with one process for each phase. It reads the log while the tests run. At the end, it shows these tables:
 
 - A PASS or FAIL table for each test, with one row for each chip and one column for each bank.
 - A bandwidth table for each test, with read and write GB/s for each bank.
@@ -121,6 +135,8 @@ The runner also writes the results to a JSON file. The runner has these options:
 | `-i <file>` | Parse this log file. The runner does not start the tests. |
 | `-o <file>` | Write the JSON results to this file. The default is `out.json`. |
 | `-l <file>` | Write the log and the summary tables to this file. |
+| `--no-retention` | Do not run the process-split data-retention cases. |
+| `--retention-only` | Run only the process-split data-retention cases. |
 
 To run one test directly, use a gtest filter:
 

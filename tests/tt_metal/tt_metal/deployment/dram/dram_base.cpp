@@ -1660,6 +1660,7 @@ DramMultiInstanceSummary run_dram_persistent_jobs_test_verbose(
                                 "Waited       : {}s\n"
                                 "Heartbeat Idle: {}s\n"
                                 "Status Jobs  : {}\n"
+                                "Status       : magic=0x{:08x} state={} stage={} heartbeat={}\n"
                                 "\n"
                                 "Expected Job : job_id={} pattern={} pass={} repeat={} bank={}\n"
                                 "Observed     : job_id={} pattern={} pass={} repeat={} bank={} words={} transfers={}\n"
@@ -1680,6 +1681,10 @@ DramMultiInstanceSummary run_dram_persistent_jobs_test_verbose(
                                 waited_s,
                                 heartbeat_idle_s,
                                 status_poll->jobs_completed,
+                                status_poll->magic,
+                                status_poll->state,
+                                status_poll->current_stage,
+                                status_poll->heartbeat_tick,
                                 expected_job.job_id,
                                 expected_job.pattern_id,
                                 expected_job.pass_index,
