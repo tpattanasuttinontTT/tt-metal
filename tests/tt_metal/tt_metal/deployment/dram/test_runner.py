@@ -38,6 +38,26 @@ testgddredc = re.compile(
     f"({timeregex}).*Test \| GDDR_EDC bdf=(\S+) device_id=(\S+) module=(\S+) "
     + "temp_top=(\S+) temp_bottom=(\S+) corr_rd=(\S+) corr_wr=(\S+) uncorr_rd=(\S+) uncorr_wr=(\S+)"
 )
+# Cycle line emitted by the t6py-like retention tests (DramDeployment_T6pyLikeRetention*) in test_dram.cpp.
+testretentioncycle = re.compile(
+    f"({timeregex}).*Test \| RETENTION_CYCLE phase=(\S+) index=(\d+) total=(\d+) loop=(\d+) pattern=(\S+) pass=(\d+)"
+)
+# Per-bank bandwidth of one phase of the t6py-like retention tests.
+testt6pybw = re.compile(
+    f"({timeregex}).*Test \| T6PY_BW bdf=(\S+) device_id=(\S+) bank=(\d+) phase=(\S+) bytes=(\d+) ticks=(\d+) gbps=(\S+)"
+)
+# Markers that this runner writes around the process-split t6py-like retention case.
+retentionsplit = re.compile("RETENTION_SPLIT (begin|end) case=(\S+)(?: status=(\S+))?")
+
+# gtest binary, and the tests that the t6py-like retention case runs, one process per phase.
+PROGRAM = "build/test/tt_metal/unit_tests_deployment"
+PHASE_WRITE = "MeshDispatchFixture.DramDeployment_T6pyLikeRetentionWrite"
+PHASE_READ = "MeshDispatchFixture.DramDeployment_T6pyLikeRetentionRead"
+# The single-phase tests are not part of the main run. The runner runs them itself (see run_t6py_like_retention).
+MAIN_FILTER = "*DramDeployment_*:-*T6pyLikeRetention*"
+RETENTION_CASE = "T6pyLikeRetention"
+# Time between the write process and the read process. No process has the device open during this time.
+DEFAULT_RETENTION_SLEEP_S = 25
 
 print_logs = True
 
@@ -106,6 +126,9 @@ class EventType(Enum):
     BANKERROR = auto()
     DRAMBW = auto()
     GDDREDC = auto()
+    RETENTIONCYCLE = auto()
+    RETENTIONSPLIT = auto()
+    T6PYBW = auto()
 
 
 @dataclass
@@ -238,6 +261,49 @@ def parse_gddredc(l: str) -> Optional[Event]:
     return Event(EventType.GDDREDC, extra)
 
 
+def parse_retentioncycle(l: str) -> Optional[Event]:
+    m = testretentioncycle.match(l)
+    if m is None:
+        return None
+
+    extra = {
+        "phase": m.group(2),
+        "index": int(m.group(3)),
+        "total": int(m.group(4)),
+        "loop": int(m.group(5)),
+        "pattern": m.group(6),
+        "pass": int(m.group(7)),
+    }
+
+    return Event(EventType.RETENTIONCYCLE, extra)
+
+
+def parse_t6pybw(l: str) -> Optional[Event]:
+    m = testt6pybw.match(l)
+    if m is None:
+        return None
+
+    extra = {
+        "bdf": m.group(2),
+        "dev_id": m.group(3),
+        "bank": int(m.group(4)),
+        "phase": m.group(5),
+        "bytes": int(m.group(6)),
+        "ticks": int(m.group(7)),
+        "gbps": float(m.group(8)),
+    }
+
+    return Event(EventType.T6PYBW, extra)
+
+
+def parse_retentionsplit(l: str) -> Optional[Event]:
+    m = retentionsplit.match(l)
+    if m is None:
+        return None
+
+    return Event(EventType.RETENTIONSPLIT, {"what": m.group(1), "case": m.group(2), "status": m.group(3)})
+
+
 def parse_line(l: str, outf: Optional[TextIO]) -> Optional[Event]:
     if print_logs:
         print(f"l: {l}")
@@ -253,6 +319,9 @@ def parse_line(l: str, outf: Optional[TextIO]) -> Optional[Event]:
         parse_mismatch,
         parse_testend,
         parse_bdf,
+        parse_retentioncycle,
+        parse_t6pybw,
+        parse_retentionsplit,
     ]
 
     for p in parsers:
@@ -298,15 +367,52 @@ def parse_evs(evs: list[Event], bdfs: dict[str, str], edc: list[dict]) -> Iterat
         if chipid not in chips:
             chips[chipid] = TestedChips(extra["bdf"], {})
 
+    # T6PY_BW values of the current run, by (dev_id, bank, phase). A process-split run has one value per cycle;
+    # the bank shows the mean.
+    t6pybw: dict[tuple[str, int, str], list[float]] = {}
+
+    def apply_t6pybw():
+        for (dev_id, bank_id, phase), values in t6pybw.items():
+            banks = chips[dev_id].banks
+            bank = banks.get(bank_id)
+            if bank is None:
+                bank = TestedBank(0, 0, 0)
+                banks[bank_id] = bank
+            mean = sum(values) / len(values)
+            if phase == "write":
+                bank.write_gbps = mean
+            else:
+                bank.read_gbps = mean
+        t6pybw.clear()
+
+    # Inside a process-split case, the gtest runs of all its processes are merged into one TestRun.
+    split_case: Optional[str] = None
+
     it = iter(evs)
     for e in it:
-        if e.typ == EventType.TESTSTART:
-            test = e.extra["name"]
-            errors = []
-        elif e.typ == EventType.TESTEND:
-            runs.append(TestRun(test, errors, chips, e.extra["status"]))
+        if e.typ == EventType.RETENTIONSPLIT:
+            if e.extra["what"] == "begin":
+                split_case = e.extra["case"]
+            else:
+                apply_t6pybw()
+                name = f"MeshDispatchFixture.DramDeployment_{e.extra['case']}"
+                runs.append(TestRun(name, errors, chips, e.extra["status"] or "FAILED"))
+                split_case = None
             errors = []
             chips = {}
+        elif e.typ == EventType.TESTSTART:
+            if split_case is None:
+                test = e.extra["name"]
+                errors = []
+        elif e.typ == EventType.TESTEND:
+            if split_case is None:
+                apply_t6pybw()
+                runs.append(TestRun(test, errors, chips, e.extra["status"]))
+                errors = []
+                chips = {}
+        elif e.typ == EventType.T6PYBW:
+            ensure_chip(e.extra)
+            t6pybw.setdefault((e.extra["dev_id"], e.extra["bank"], e.extra["phase"]), []).append(e.extra["gbps"])
         elif e.typ == EventType.MISMATCH:
             errors.append(e.extra)
         elif e.typ == EventType.BDF:
@@ -329,6 +435,9 @@ def parse_evs(evs: list[Event], bdfs: dict[str, str], edc: list[dict]) -> Iterat
             bank.read_bpc = e.extra["read_bpc"]
         elif e.typ == EventType.GDDREDC:
             bdfs[e.extra["dev_id"]] = e.extra["bdf"]
+            # Each test process reads EDC once at its end. The counters are cumulative since reset,
+            # so keep only the latest reading of each module.
+            edc[:] = [x for x in edc if (x["dev_id"], x["module"]) != (e.extra["dev_id"], e.extra["module"])]
             edc.append(e.extra)
 
     yield from runs
@@ -488,6 +597,96 @@ async def parse_file(file: str, outf: Optional[TextIO]) -> list[Event]:
     return await parse_logs(sr, outf)
 
 
+def note(msg: str, outf: Optional[TextIO]) -> None:
+    """Runner progress message: shown with the test log and written to the log file."""
+    if print_logs:
+        print(msg)
+    if outf:
+        print(msg, file=outf)
+
+
+async def run_gtest(gtest_filter: str, env: dict, outf: Optional[TextIO]) -> tuple[int, list[Event]]:
+    """Runs the gtest binary in a new process and parses its log."""
+    proc = await asyncio.create_subprocess_exec(
+        PROGRAM, f"--gtest_filter={gtest_filter}", stdout=asyncio.subprocess.PIPE, env=env
+    )
+    exit_status, evs = await asyncio.gather(proc.wait(), parse_logs(proc.stdout, outf))
+    return exit_status, evs
+
+
+def finished_statuses(evs: list[Event]) -> list[str]:
+    return [e.extra["status"] for e in evs if e.typ == EventType.TESTEND]
+
+
+async def run_t6py_like_retention(env: dict, sleep_s: int, outf: Optional[TextIO]) -> tuple[int, list[Event]]:
+    """Runs the t6py-like retention case over all cycles. A cycle is one (loop, pattern, pass) of the
+    deployment pattern list; the test processes select it with DRAM_TEST_RETENTION_CYCLE.
+
+    For each cycle: a write process writes the whole region of every bank and exits. The runner sleeps for
+    sleep_s seconds with no process open on the device. Then a new read process reads the whole region and
+    checks it. This is the same as t6py `dram-test ... --skip_reads 1 all`, then `dram-test ... --skip_writes 1 all`.
+
+    Every process logs RETENTION_CYCLE with the total number of cycles. The case stops early if a process
+    does not finish its test (crash, watchdog, Ctrl+C).
+    """
+    evs: list[Event] = []
+    exit_status = 0
+    status = "OK"
+
+    evs.append(parse_line(f"RETENTION_SPLIT begin case={RETENTION_CASE}", outf))
+
+    steps = [PHASE_WRITE, None, PHASE_READ]
+
+    cycle = 0
+    total: Optional[int] = None
+    stop = False
+    while not stop and (total is None or cycle < total):
+        for step in steps:
+            if step is None:
+                # The sleep step comes after the write step, so total is known here.
+                note(
+                    f"RETENTION_SPLIT {RETENTION_CASE} cycle {cycle + 1}/{total}: sleep {sleep_s} s, device closed",
+                    outf,
+                )
+                await asyncio.sleep(sleep_s)
+                continue
+
+            step_env = dict(env, DRAM_TEST_RETENTION_CYCLE=str(cycle))
+            step_status, step_evs = await run_gtest(step, step_env, outf)
+            evs.extend(step_evs)
+            exit_status = exit_status or step_status
+
+            cycles = [e for e in step_evs if e.typ == EventType.RETENTIONCYCLE]
+            if cycles:
+                total = cycles[0].extra["total"]
+
+            statuses = finished_statuses(step_evs)
+            if "SKIPPED" in statuses:
+                status = "SKIPPED"
+                stop = True
+            elif len(statuses) != 1 or total is None:
+                status = "FAILED"
+                note(
+                    f"RETENTION_SPLIT {RETENTION_CASE} cycle {cycle + 1}: process did not finish its test, stopping",
+                    outf,
+                )
+                stop = True
+            elif "FAILED" in statuses:
+                # A data mismatch: record it and continue with the next cycles.
+                status = "FAILED"
+
+            if stop:
+                break
+
+        cycle += 1
+
+    if status != "OK" and exit_status == 0:
+        exit_status = 1
+
+    evs.append(parse_line(f"RETENTION_SPLIT end case={RETENTION_CASE} status={status}", outf))
+    return exit_status, evs
+
+
 async def main():
     parser = ArgumentParser()
     parser.add_argument("-q", action="store_true", help="Don't print the logs as the tests run")
@@ -496,6 +695,14 @@ async def main():
     parser.add_argument("-i", type=str, help="Input file to parse instead of running the tests")
     parser.add_argument("-o", type=str, help="Output path for the json file")
     parser.add_argument("-l", type=str, help="File path to output logs to")
+    parser.add_argument("--no-retention", action="store_true", help="Don't run the t6py-like data-retention case")
+    parser.add_argument("--retention-only", action="store_true", help="Run only the t6py-like data-retention case")
+    parser.add_argument(
+        "--retention-sleep-s",
+        type=int,
+        default=DEFAULT_RETENTION_SLEEP_S,
+        help=f"Seconds between the write and the read process of each retention cycle (default {DEFAULT_RETENTION_SLEEP_S})",
+    )
     opts = parser.parse_args()
 
     logpath = opts.l if opts.l else None
@@ -514,16 +721,18 @@ async def main():
     if opts.i:
         evs = await parse_file(opts.i, logf)
     else:
-        program = "build/test/tt_metal/unit_tests_deployment"
-        args = ["--gtest_filter=*DramDeployment_*"]
-
-        env = os.environ
+        env = dict(os.environ)
         if not opts.v:
             env["TT_LOGGER_TYPES"] = "Test"
 
-        proc = await asyncio.create_subprocess_exec(program, *args, stdout=asyncio.subprocess.PIPE, env=env)
+        evs = []
+        if not opts.retention_only:
+            exit_status, evs = await run_gtest(MAIN_FILTER, env, logf)
 
-        exit_status, evs = await asyncio.gather(proc.wait(), parse_logs(proc.stdout, logf))
+        if not opts.no_retention:
+            case_status, case_evs = await run_t6py_like_retention(env, opts.retention_sleep_s, logf)
+            evs.extend(case_evs)
+            exit_status = exit_status or case_status
 
     # pprint.pp(evs)
     bdfs = {}

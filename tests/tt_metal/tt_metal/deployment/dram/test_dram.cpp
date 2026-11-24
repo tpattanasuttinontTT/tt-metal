@@ -2124,4 +2124,367 @@ TEST_F(MeshDispatchFixture, DramDeployment_PersistentPartitionedWorkersAllDramBa
     ASSERT_TRUE(all_pass);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// t6py-like data retention (DramDeployment_T6pyLikeRetentionWrite and DramDeployment_T6pyLikeRetentionRead)
+//
+// These two tests copy the t6py flow `dram-test ... --skip_reads 1 all`, then `dram-test ... --skip_writes 1 all`:
+// one process writes the whole bank and exits, then a new process reads the whole bank and checks it. Each
+// address is written one time and read one time. test_runner.py runs the two processes and sleeps between them
+// with no process open on the device.
+//
+// One process runs one cycle. A cycle is one (loop, pattern, pass) of the deployment pattern list, in the same
+// order and with the same seeds as the other tests. DRAM_TEST_RETENTION_CYCLE selects the cycle. Without this
+// variable, the tests are skipped.
+//
+// Worker layout: the same as DramDeployment_PersistentPartitionedWorkersAllDramBanks. Worker core n tests bank
+// n % <number of banks>, and the region of each bank is divided into equal 4 KiB aligned parts, one for each of
+// its worker cores. t6py assigns 12 cores to each controller in the same way.
+// ---------------------------------------------------------------------------------------------------------------
+
+enum class DramT6pyLikePhase { Write, Read };
+
+// The cycle that the t6py-like tests run. Unset or empty gives std::nullopt.
+static std::optional<uint64_t> get_dram_retention_cycle_from_env() {
+    const char* env = std::getenv("DRAM_TEST_RETENTION_CYCLE");
+    if (!env || env[0] == '\0') {
+        return std::nullopt;
+    }
+
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(env, &end, 0);
+    TT_FATAL(end != env && *end == '\0', "Invalid DRAM_TEST_RETENTION_CYCLE: {}", env);
+
+    return static_cast<uint64_t>(value);
+}
+
+struct DramT6pyLikeRegion {
+    uint64_t bank_offset = 0;  // Bank address of the start of the region.
+    uint32_t bytes = 0;        // Size of the region in each bank.
+};
+
+// Region of each bank for the t6py-like tests.
+// It starts at the unreserved DRAM base of metal, aligned up to 4 KiB. Metal writes to the bottom of each bank
+// when it opens and closes the device (for example, the DRAM barrier word at offset 0). Thus data there does
+// not survive from the write process to the read process.
+// Without DRAM_TEST_MBYTES, the region goes to the test limit, the same as t6py `--size_bytes 0xff000000`.
+static DramT6pyLikeRegion get_dram_t6py_like_region() {
+    DramT6pyLikeRegion region{};
+
+    region.bank_offset =
+        (static_cast<uint64_t>(MetalContext::instance().hal().get_dev_addr(HalDramMemAddrType::UNRESERVED)) +
+         0xFFFull) &
+        ~0xFFFull;
+    TT_FATAL(
+        region.bank_offset < DRAM_TEST_EFFECTIVE_MAX_BANK_BYTES,
+        "Unreserved DRAM base {} is past the test limit",
+        region.bank_offset);
+
+    const uint64_t max_bytes = DRAM_TEST_EFFECTIVE_MAX_BANK_BYTES - region.bank_offset;
+    uint64_t bytes = max_bytes;
+
+    const char* env = std::getenv("DRAM_TEST_MBYTES");
+    if (env != nullptr && env[0] != '\0') {
+        bytes = std::min<uint64_t>(get_dram_test_bytes_from_env(DRAM_TEST_BYTES), max_bytes);
+    }
+
+    region.bytes = static_cast<uint32_t>(bytes & ~static_cast<uint64_t>(DRAM_TEST_NOC_WORD_BYTES - 1u));
+    return region;
+}
+
+static void run_t6py_like_retention_phase(
+    MeshDispatchFixture* fixture,
+    const std::vector<std::shared_ptr<distributed::MeshDevice>>& devices,
+    DramT6pyLikePhase phase) {
+    if (g_stop_requested.load()) {
+        GTEST_SKIP() << "Test interrupted by user.";
+    }
+    g_stop_message_printed.store(false);
+    g_watchdog_requested.store(false);
+
+    const char* phase_name = (phase == DramT6pyLikePhase::Write) ? "write" : "read";
+    const std::string test_label = fmt::format("T6pyLike Retention {}", phase_name);
+
+    const auto cycle = get_dram_retention_cycle_from_env();
+    if (!cycle.has_value()) {
+        GTEST_SKIP() << "Set DRAM_TEST_RETENTION_CYCLE to run this test. test_runner.py does this.";
+    }
+    const uint64_t selected_cycle = *cycle;
+
+    const uint32_t repeats = get_dram_test_loops_from_env(1u);
+    constexpr uint32_t initial_seed = 0x12345678u;
+    constexpr uint32_t advance_seed = 1u;
+
+    const auto& kDeploymentPatterns = get_deployment_patterns_from_env();
+
+    const uint32_t chunk_bytes = get_dram_chunk_bytes_from_env(4096u);
+    const uint32_t transfer_len_mode = get_dram_transfer_len_mode_from_env();
+    const uint32_t access_mode = dram_access_mode_to_work_item(get_dram_access_mode_from_env());
+    const auto noc_mode = get_dram_noc_mode_from_env();
+    const DramT6pyLikeRegion region = get_dram_t6py_like_region();
+
+    // Find the loop, pattern, pass, seed and NOCs of the selected cycle. Walk all cycles in the same order as
+    // the other tests, so the seed and the NOC selection are the same.
+    uint64_t total_cycles = 0;
+    for (uint32_t pattern_id : kDeploymentPatterns) {
+        total_cycles += num_passes_for_pattern(pattern_id);
+    }
+    total_cycles *= repeats;
+
+    if (selected_cycle >= total_cycles) {
+        FAIL() << "DRAM_TEST_RETENTION_CYCLE=" << selected_cycle << " is out of range (" << total_cycles << " cycles)";
+    }
+
+    struct SelectedCycle {
+        uint32_t repeat_index = 0;
+        uint32_t pattern_id = 0;
+        uint32_t pass_index = 0;
+        uint32_t seed = 0;
+        uint32_t write_noc = 0;
+        uint32_t read_noc = 0;
+    } sel{};
+
+    {
+        uint64_t cycle_index = 0;
+        uint32_t seed = initial_seed;
+        uint64_t pattern_toggle_index = 0;
+        bool found = false;
+        for (uint32_t repeat_index = 0; repeat_index < repeats && !found; repeat_index++) {
+            for (uint32_t pattern_id : kDeploymentPatterns) {
+                const uint32_t num_passes = num_passes_for_pattern(pattern_id);
+                if (selected_cycle < cycle_index + num_passes) {
+                    sel.repeat_index = repeat_index;
+                    sel.pattern_id = pattern_id;
+                    sel.pass_index = static_cast<uint32_t>(selected_cycle - cycle_index);
+                    sel.seed = seed;
+                    sel.write_noc = resolve_noc(noc_mode, pattern_toggle_index);
+                    sel.read_noc = resolve_noc(noc_mode, pattern_toggle_index + 1);
+                    found = true;
+                    break;
+                }
+                cycle_index += num_passes;
+                pattern_toggle_index++;
+            }
+            seed += advance_seed;
+        }
+        TT_FATAL(found, "Retention cycle {} not found", selected_cycle);
+    }
+
+    std::signal(SIGINT, handle_sigint);
+    log_blackhole_galaxy_pci_bdfs_once();
+    log_dram_pattern_mode_once();
+    log_dram_access_mode_once();
+
+    // test_runner.py reads this line to find the number of cycles.
+    log_info(
+        tt::LogTest,
+        "RETENTION_CYCLE phase={} index={} total={} loop={} pattern={} pass={}",
+        phase_name,
+        selected_cycle,
+        total_cycles,
+        sel.repeat_index,
+        pattern_name(sel.pattern_id),
+        sel.pass_index);
+    log_info(
+        tt::LogTest,
+        "{}: region per bank 0x{:x}..0x{:x} ({} bytes), chunk_bytes={}",
+        test_label,
+        region.bank_offset,
+        region.bank_offset + region.bytes,
+        region.bytes,
+        chunk_bytes);
+
+    const uint32_t chips_to_test = get_dram_max_chips_from_env(devices.size());
+    log_info(tt::LogTest, "Testing {} of {} available chip(s), parallel execution=YES", chips_to_test, devices.size());
+
+    std::mutex summary_mutex;
+    bool all_pass = true;
+    DramGalaxySummary galaxy{};
+    const auto galaxy_start = std::chrono::steady_clock::now();
+
+    auto run_one_chip = [&](size_t chip_index) {
+        if (g_stop_requested.load()) {
+            return;
+        }
+
+        DramGalaxySummary chip_summary{};
+        chip_summary.chips_tested = 1;
+
+        const auto& mesh_device = devices[chip_index];
+        const auto device_id = mesh_device->get_device_ids()[0];
+        register_edc_device(device_id);
+
+        const uint32_t num_dram_channels = mesh_device->num_dram_channels();
+        const auto worker_cores = get_worker_cores_for_deployment(mesh_device.get());
+
+        TT_FATAL(num_dram_channels > 0, "No DRAM channels found");
+        TT_FATAL(
+            worker_cores.size() >= num_dram_channels,
+            "Need at least one worker per DRAM channel: workers={} dram_channels={}",
+            worker_cores.size(),
+            num_dram_channels);
+
+        std::vector<std::vector<size_t>> workers_for_bank(num_dram_channels);
+        for (size_t worker_idx = 0; worker_idx < worker_cores.size(); worker_idx++) {
+            workers_for_bank[worker_idx % num_dram_channels].push_back(worker_idx);
+        }
+
+        log_info(
+            tt::LogTest,
+            "bdf={} device_id={} {}: workers={} dram_channels={} workers_per_bank={}-{}",
+            pci_bdf_for_device_id(device_id),
+            device_id,
+            test_label,
+            worker_cores.size(),
+            num_dram_channels,
+            workers_for_bank.back().size(),
+            workers_for_bank.front().size());
+
+        std::vector<std::vector<DramWorkItem>> jobs_per_core(worker_cores.size());
+        uint32_t job_id = 1u;
+
+        for (uint32_t bank_id = 0; bank_id < num_dram_channels; bank_id++) {
+            const auto& bank_workers = workers_for_bank[bank_id];
+
+            // Equal parts aligned to 4 KiB. The last worker core also gets the bytes that remain.
+            const uint64_t bytes_per_core_base = (region.bytes / bank_workers.size()) & ~0xFFFull;
+            TT_FATAL(
+                bytes_per_core_base >= chunk_bytes,
+                "Region part per worker core too small: {} < chunk_bytes {}",
+                bytes_per_core_base,
+                chunk_bytes);
+            const uint64_t remainder_bytes = region.bytes - bytes_per_core_base * bank_workers.size();
+
+            for (size_t local_idx = 0; local_idx < bank_workers.size(); local_idx++) {
+                const uint64_t bank_offset = region.bank_offset + local_idx * bytes_per_core_base;
+                uint64_t bytes_this_core = bytes_per_core_base;
+                if (local_idx == bank_workers.size() - 1) {
+                    bytes_this_core += remainder_bytes;
+                }
+                TT_FATAL(bytes_this_core <= std::numeric_limits<uint32_t>::max(), "bytes_this_core must fit uint32_t");
+
+                DramWorkItem job{};
+                job.job_id = job_id++;
+                job.bank_id = bank_id;
+                job.bank_offset_lo = static_cast<uint32_t>(bank_offset & 0xFFFFFFFFull);
+                job.bank_offset_hi = static_cast<uint32_t>(bank_offset >> 32);
+                job.total_bytes = static_cast<uint32_t>(bytes_this_core);
+                job.chunk_bytes = chunk_bytes;
+                job.pattern_id = sel.pattern_id;
+                job.seed = sel.seed;
+                job.pass_index = sel.pass_index;
+                job.repeat_index = sel.repeat_index;
+                job.write_noc = sel.write_noc;
+                job.read_noc = sel.read_noc;
+                job.max_burst_len = chunk_bytes;
+                job.transfer_len_mode = transfer_len_mode;
+                job.access_mode = access_mode;
+                // The write process only writes. The read process only reads and checks.
+                job.skip_writes = (phase == DramT6pyLikePhase::Write) ? 0u : 1u;
+                job.skip_reads = (phase == DramT6pyLikePhase::Write) ? 1u : 0u;
+
+                jobs_per_core[bank_workers[local_idx]].push_back(job);
+            }
+        }
+
+        const uint64_t total_jobs_for_chip = job_id - 1u;
+        const auto start = std::chrono::steady_clock::now();
+
+        DramMultiInstanceSummary run = run_dram_persistent_jobs_test_verbose(
+            fixture, mesh_device, worker_cores, jobs_per_core, chunk_bytes, DataMovementProcessor::RISCV_0);
+
+        const auto end = std::chrono::steady_clock::now();
+        const auto duration_sec = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
+
+        accumulate_galaxy_summary(chip_summary, run, total_jobs_for_chip);
+        chip_summary.chips.push_back(make_chip_bank_summary(device_id, num_dram_channels, run));
+
+        // Bank bandwidth of this phase, the same measure as t6py "average BW per dram": the bytes of the bank
+        // region divided by the job time of the slowest worker core of the bank. The job time includes the data
+        // generation and, in the read phase, the compare. All worker cores start at about the same time.
+        std::vector<uint64_t> bank_max_ticks(num_dram_channels, 0u);
+        for (const auto& per_core : run.per_core_results) {
+            const DramBaseResult& r = per_core.result;
+            if (r.bank_id < num_dram_channels) {
+                bank_max_ticks[r.bank_id] = std::max<uint64_t>(bank_max_ticks[r.bank_id], r.job_total_ticks);
+            }
+        }
+        const uint32_t clock_mhz = static_cast<uint32_t>(mesh_device->get_clock_rate_mhz());
+
+        const bool chip_pass = run.summary.pass && !g_watchdog_requested.load();
+        if (g_watchdog_requested.load()) {
+            g_stop_requested.store(true);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(summary_mutex);
+
+            log_info(
+                tt::LogTest,
+                "=== {} Chip Summary bdf={} device_id={} ===",
+                test_label,
+                pci_bdf_for_device_id(device_id),
+                device_id);
+
+            for (uint32_t bank_id = 0; bank_id < num_dram_channels; bank_id++) {
+                // test_runner.py reads this line.
+                log_info(
+                    tt::LogTest,
+                    "T6PY_BW bdf={} device_id={} bank={} phase={} bytes={} ticks={} gbps={:.4f}",
+                    pci_bdf_for_device_id(device_id),
+                    device_id,
+                    bank_id,
+                    phase_name,
+                    region.bytes,
+                    bank_max_ticks[bank_id],
+                    dram_bw_gbps(region.bytes, bank_max_ticks[bank_id], clock_mhz));
+            }
+
+            std::string message = fmt::format(
+                "bdf={} device_id={} workers={} dram_channels={} jobs={} duration={} checked_bytes={} pass={}",
+                pci_bdf_for_device_id(device_id),
+                device_id,
+                worker_cores.size(),
+                num_dram_channels,
+                total_jobs_for_chip,
+                format_duration_seconds(duration_sec),
+                run.summary.checked_bytes,
+                chip_pass ? "YES" : "NO");
+            if (chip_pass) {
+                log_info(tt::LogTest, "{}", message);
+            } else {
+                log_critical(tt::LogTest, "{}", message);
+            }
+
+            merge_galaxy_summary(galaxy, chip_summary);
+            all_pass &= chip_pass;
+        }
+    };
+
+    run_chips_in_parallel(chips_to_test, run_one_chip);
+
+    const auto galaxy_end = std::chrono::steady_clock::now();
+    log_galaxy_summary(
+        test_label.c_str(), galaxy, std::chrono::duration_cast<std::chrono::seconds>(galaxy_end - galaxy_start));
+
+    all_pass &= galaxy.pass;
+
+    if (g_watchdog_requested.load()) {
+        FAIL() << "Test aborted by stall watchdog.";
+    }
+
+    if (g_stop_requested.load()) {
+        GTEST_SKIP() << "Test interrupted by user.";
+    }
+
+    ASSERT_TRUE(all_pass);
+}
+
+TEST_F(MeshDispatchFixture, DramDeployment_T6pyLikeRetentionWrite) {
+    run_t6py_like_retention_phase(this, devices_, DramT6pyLikePhase::Write);
+}
+
+TEST_F(MeshDispatchFixture, DramDeployment_T6pyLikeRetentionRead) {
+    run_t6py_like_retention_phase(this, devices_, DramT6pyLikePhase::Read);
+}
+
 }  // namespace tt::tt_metal

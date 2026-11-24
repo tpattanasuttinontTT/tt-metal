@@ -1268,6 +1268,10 @@ DramMultiInstanceSummary run_dram_persistent_jobs_test_verbose(
             r.wake_flag_l1_addr);
     }
 
+    // The host writes above are posted. Make sure that they are in L1 before the program starts: the kernel can
+    // otherwise see the new queue tail while part of a job slot still holds data from an earlier run.
+    MetalContext::instance().get_cluster().l1_barrier(device_id);
+
     DramMultiInstanceSummary out{};
     out.summary.pass = true;
     out.summary.bank_id = 0;
@@ -1873,6 +1877,8 @@ DramMultiInstanceSummary run_dram_persistent_jobs_test_verbose(
                     }
 
                     if (tail != r.host_tail_shadow) {
+                        // The new job slots must be in L1 before the kernel can see the new tail.
+                        MetalContext::instance().get_cluster().l1_barrier(device_id);
                         write_core_u32(
                             *mesh_device, r.core, r.queue_ctrl_l1_addr + offsetof(DramJobQueueCtrl, tail), tail);
 

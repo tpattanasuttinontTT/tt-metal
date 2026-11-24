@@ -106,7 +106,10 @@ static inline void generate_range_and_publish(
     fill.base_word_index = mb[MB_GENERATE_BASE_WORD_INDEX];
     fill.word_count = mb[MB_GENERATE_WORD_COUNT];
 
-    dram_fill_pattern_buffer_range(dst_words, fill, start_word, end_word);
+    // dram_fill_pattern_buffer_range takes (destination of this range, offset in the chunk, word count).
+    // Passing (dst_words, start_word, end_word) made PACK write the whole buffer from word 0 with values
+    // shifted by start_word, and race MATH on the first half.
+    dram_fill_pattern_buffer_range(dst_words + start_word, fill, start_word, end_word - start_word);
 
     prof_add_u64(mb, prof_generate_counter_idx(helper_id), timestamp() - prof_t0);
 
