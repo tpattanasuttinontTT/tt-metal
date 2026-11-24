@@ -66,9 +66,13 @@ A cycle is one pass of one pattern in one loop. The cycles use all the patterns 
 In each cycle, each address in the region is written one time and read one time.
 
 - Worker cores: the same layout as `DramDeployment_PersistentPartitionedWorkersAllDramBanks`. Worker core `n` tests bank `n % <number of banks>`. The region of each bank is divided into equal parts, aligned to 4 KiB, one part for each worker core of the bank. t6py `all` mode also divides each controller among 12 cores.
-- Region: the region starts at the unreserved DRAM base of metal (about 5.6 MiB on Blackhole), aligned up to 4 KiB, not at offset 0. Metal writes to the bottom of each bank when it opens and closes the device, so data there does not survive from the write process to the read process. If `DRAM_TEST_MBYTES` is not set, the region goes to the test limit (about 4074 MiB, almost the full bank, the same as t6py `--size_bytes 0xff000000`). If `DRAM_TEST_MBYTES` is set, the region has that size.
+- Region: the region must not overlap DRAM that metal writes, because the data must survive from the write process to the read process.
+  - Bottom: the region starts at the unreserved DRAM base of metal (about 5.6 MiB on Blackhole), aligned up to 4 KiB, not at offset 0. Metal writes to the bottom of each bank when it opens and closes the device.
+  - Top: metal puts the kernel binaries of each program in a DRAM buffer at the top of each bank (about 248 KiB on Blackhole), and writes them each time it sends the program. Thus each process reserves the region in the DRAM allocator with a bottom-up buffer, and leaves 16 MiB at the top for metal. If metal needs more space, its allocation fails with an error. Metal does not write into the region.
+  - Size: if `DRAM_TEST_MBYTES` is not set, the region is about 4058 MiB (`0x594000`..`0xfdfff000`), almost the full bank, like t6py `--size_bytes 0xff000000`. If `DRAM_TEST_MBYTES` is set, the region has that size.
 - Bandwidth: each process shows one `T6PY_BW` line for each bank. The value is the size of the bank region divided by the job time of the slowest worker core of the bank. This is the same measure as the t6py `average BW per dram`. It includes the data generation and, in the read phase, the compare. The bandwidth table of the runner shows the mean over all cycles. This is a different measure from the bandwidth of the other tests, which counts only the NCRISC transfer time of each core.
-- Result: the runner shows one result for the case. If a cycle finds a mismatch, the case fails and the runner continues with the next cycle. If a process does not complete its test (for example, after a watchdog exit), the runner stops the case.
+- Result: the runner shows one result for the case. If a cycle finds a mismatch, the case fails and the runner continues with the next cycle. If a process does not complete its test (for example, after a watchdog exit, or when the device cannot be opened), the runner stops the case.
+- Known issue: sometimes the persistent program of one chip does not start (the watchdog shows `Status Jobs : 0` and `transfers=0` for job 1). The watchdog then stops the process, and the runner stops the case. This was seen in about 1 of 10 processes, often on the first process after the device was idle, for example the read process after the sleep. Root cause not found yet.
 
 The two gtests run one cycle each. The runner selects the cycle with `DRAM_TEST_RETENTION_CYCLE`. Without this variable, the two gtests are skipped. To run one cycle by hand:
 
@@ -152,7 +156,7 @@ All variables are optional. Set them in the shell before you start the test or t
 
 | Variable | Default | Description |
 |---|---|---|
-| `DRAM_TEST_MBYTES` | `32` | Size in MiB of the test region in each DRAM bank. The test starts at offset 0 of each bank. Values larger than the bank size minus 2048 bytes are reduced to that limit. The value must be more than 0. T6pyLikeRetention starts at the unreserved DRAM base instead, and without this variable it tests the full bank. |
+| `DRAM_TEST_MBYTES` | `32` | Size in MiB of the test region in each DRAM bank. The test starts at offset 0 of each bank. Values larger than the bank size minus 2048 bytes are reduced to that limit. The value must be more than 0. T6pyLikeRetention starts at the unreserved DRAM base instead, and without this variable it tests almost the full bank (refer to [T6pyLikeRetention](#t6pylikeretention-process-split-test_runnerpy)). |
 | `DRAM_TEST_RETENTION_CYCLE` | not set | T6pyLikeRetention gtests only. The cycle (loop, pattern, pass) that the process runs, from 0. `test_runner.py` sets it. Without it, the two gtests are skipped. |
 | `DRAM_TEST_LOOPS` | `1` | Number of times to run the full pattern list. A value of 0, or a value that is not a number, gives 1. Each loop tests the same region again. |
 | `DRAM_TEST_FAST` | off | Set to `1` to run only 4 patterns: Checkerboard, Random, Counter, and Address. |

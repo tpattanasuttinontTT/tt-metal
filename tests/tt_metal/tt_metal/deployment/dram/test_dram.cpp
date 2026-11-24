@@ -10,6 +10,9 @@
 #include <tt-logger/tt-logger.hpp>
 
 #include <llrt/tt_cluster.hpp>
+#include <tt-metalium/allocator.hpp>
+#include <tt-metalium/buffer.hpp>
+#include <tt-metalium/mesh_buffer.hpp>
 #include "impl/context/metal_context.hpp"
 #include <umd/device/types/gddr_telemetry.hpp>
 #include <umd/device/firmware/firmware_info_provider.hpp>
@@ -2157,37 +2160,102 @@ static std::optional<uint64_t> get_dram_retention_cycle_from_env() {
     return static_cast<uint64_t>(value);
 }
 
+// Space at the top of each bank that the t6py-like region leaves for metal. The DRAM allocator places metal
+// buffers from the top of the bank down. For example, metal puts the kernel binaries of each program in a DRAM
+// buffer and writes them when the program is sent (see mesh_workload.cpp). On Blackhole this buffer is about
+// 248 KiB in each bank for the persistent DRAM program.
+static constexpr uint64_t kDramT6pyLikeMetalReserveBytes = 16ull * 1024ull * 1024ull;
+
 struct DramT6pyLikeRegion {
     uint64_t bank_offset = 0;  // Bank address of the start of the region.
     uint32_t bytes = 0;        // Size of the region in each bank.
+    // Allocator reservations of the region, one for each chip. Keep them until the jobs are done.
+    std::vector<std::shared_ptr<distributed::MeshBuffer>> reservations;
 };
 
-// Region of each bank for the t6py-like tests.
-// It starts at the unreserved DRAM base of metal, aligned up to 4 KiB. Metal writes to the bottom of each bank
-// when it opens and closes the device (for example, the DRAM barrier word at offset 0). Thus data there does
-// not survive from the write process to the read process.
-// Without DRAM_TEST_MBYTES, the region goes to the test limit, the same as t6py `--size_bytes 0xff000000`.
-static DramT6pyLikeRegion get_dram_t6py_like_region() {
-    DramT6pyLikeRegion region{};
+// Region of each bank for the t6py-like tests. The data must survive from the write process to the read process,
+// so the region must not overlap any DRAM that metal writes:
+// - Metal writes to the bottom of each bank, below the unreserved DRAM base, when it opens and closes the device
+//   (for example, the DRAM barrier word at offset 0). The region starts above it.
+// - Metal writes its own DRAM buffers, for example the kernel binaries of each program, which the allocator places
+//   at the top of the bank. Thus the test reserves the region in the DRAM allocator with a bottom-up buffer, and
+//   leaves kDramT6pyLikeMetalReserveBytes at the top for metal. If metal needs more, its allocation fails with an
+//   error, instead of a silent write into the region.
+// The first bottom-up allocation of a process starts at the unreserved base, so the region is the same in the
+// write process and the read process. Without DRAM_TEST_MBYTES, the region is almost the full bank, like t6py
+// `--size_bytes 0xff000000`.
+static DramT6pyLikeRegion reserve_dram_t6py_like_region(
+    const std::vector<std::shared_ptr<distributed::MeshDevice>>& devices, uint32_t chips_to_test) {
+    constexpr uint64_t kPageBytes = 4096u;
+    const uint64_t unreserved =
+        static_cast<uint64_t>(MetalContext::instance().hal().get_dev_addr(HalDramMemAddrType::UNRESERVED));
 
-    region.bank_offset =
-        (static_cast<uint64_t>(MetalContext::instance().hal().get_dev_addr(HalDramMemAddrType::UNRESERVED)) +
-         0xFFFull) &
-        ~0xFFFull;
+    // Largest region for every chip: from the unreserved base, aligned up to 4 KiB (the reservation can start
+    // below it, at the unreserved base), to the end of the allocator bank minus the space for metal.
+    uint64_t limit = DRAM_TEST_EFFECTIVE_MAX_BANK_BYTES;
+    for (uint32_t chip_index = 0; chip_index < chips_to_test; chip_index++) {
+        limit =
+            std::min<uint64_t>(limit, unreserved + devices[chip_index]->allocator()->get_bank_size(BufferType::DRAM));
+    }
+    const uint64_t aligned_start = (unreserved + kPageBytes - 1u) & ~(kPageBytes - 1u);
     TT_FATAL(
-        region.bank_offset < DRAM_TEST_EFFECTIVE_MAX_BANK_BYTES,
-        "Unreserved DRAM base {} is past the test limit",
-        region.bank_offset);
+        limit > aligned_start + kDramT6pyLikeMetalReserveBytes,
+        "DRAM bank too small for the t6py-like region: unreserved=0x{:x} limit=0x{:x}",
+        unreserved,
+        limit);
+    const uint64_t max_bytes = limit - kDramT6pyLikeMetalReserveBytes - aligned_start;
 
-    const uint64_t max_bytes = DRAM_TEST_EFFECTIVE_MAX_BANK_BYTES - region.bank_offset;
     uint64_t bytes = max_bytes;
-
     const char* env = std::getenv("DRAM_TEST_MBYTES");
     if (env != nullptr && env[0] != '\0') {
         bytes = std::min<uint64_t>(get_dram_test_bytes_from_env(DRAM_TEST_BYTES), max_bytes);
     }
+    // A whole number of pages, so that the reservation has the same size in each bank.
+    bytes &= ~(kPageBytes - 1u);
+    TT_FATAL(bytes > 0, "t6py-like region is empty");
 
-    region.bytes = static_cast<uint32_t>(bytes & ~static_cast<uint64_t>(DRAM_TEST_NOC_WORD_BYTES - 1u));
+    DramT6pyLikeRegion region{};
+    region.bytes = static_cast<uint32_t>(bytes);
+
+    for (uint32_t chip_index = 0; chip_index < chips_to_test; chip_index++) {
+        const auto& mesh_device = devices[chip_index];
+        const uint32_t num_banks = mesh_device->num_dram_channels();
+
+        // One extra page in each bank, so the region can start at a 4 KiB aligned address in the reservation.
+        const distributed::DeviceLocalBufferConfig local_config{
+            .page_size = kPageBytes,
+            .buffer_type = BufferType::DRAM,
+            .bottom_up = true,
+        };
+        const distributed::ReplicatedBufferConfig global_config{
+            .size = (bytes + kPageBytes) * num_banks,
+        };
+        auto reservation = distributed::MeshBuffer::create(global_config, local_config, mesh_device.get());
+
+        const uint64_t start = (reservation->address() + kPageBytes - 1u) & ~(kPageBytes - 1u);
+        if (chip_index == 0) {
+            region.bank_offset = start;
+        }
+        TT_FATAL(
+            start == region.bank_offset,
+            "t6py-like region starts at 0x{:x} on device {} but at 0x{:x} on the first chip",
+            start,
+            mesh_device->get_device_ids()[0],
+            region.bank_offset);
+
+        log_info(
+            tt::LogTest,
+            "T6pyLike region: device_id={} reserved bank addresses 0x{:x}..0x{:x} in the DRAM allocator (bank end "
+            "0x{:x}, {} bytes left at the top for metal)",
+            mesh_device->get_device_ids()[0],
+            reservation->address(),
+            reservation->address() + bytes + kPageBytes,
+            limit,
+            limit - (reservation->address() + bytes + kPageBytes));
+
+        region.reservations.push_back(std::move(reservation));
+    }
+
     return region;
 }
 
@@ -2220,7 +2288,8 @@ static void run_t6py_like_retention_phase(
     const uint32_t transfer_len_mode = get_dram_transfer_len_mode_from_env();
     const uint32_t access_mode = dram_access_mode_to_work_item(get_dram_access_mode_from_env());
     const auto noc_mode = get_dram_noc_mode_from_env();
-    const DramT6pyLikeRegion region = get_dram_t6py_like_region();
+    const uint32_t chips_to_test = get_dram_max_chips_from_env(devices.size());
+    const DramT6pyLikeRegion region = reserve_dram_t6py_like_region(devices, chips_to_test);
 
     // Find the loop, pattern, pass, seed and NOCs of the selected cycle. Walk all cycles in the same order as
     // the other tests, so the seed and the NOC selection are the same.
@@ -2293,7 +2362,6 @@ static void run_t6py_like_retention_phase(
         region.bytes,
         chunk_bytes);
 
-    const uint32_t chips_to_test = get_dram_max_chips_from_env(devices.size());
     log_info(tt::LogTest, "Testing {} of {} available chip(s), parallel execution=YES", chips_to_test, devices.size());
 
     std::mutex summary_mutex;

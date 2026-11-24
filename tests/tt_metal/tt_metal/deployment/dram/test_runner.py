@@ -661,10 +661,13 @@ async def run_t6py_like_retention(env: dict, sleep_s: int, outf: Optional[TextIO
                 total = cycles[0].extra["total"]
 
             statuses = finished_statuses(step_evs)
-            if "SKIPPED" in statuses:
+            # gtest marks the test SKIPPED when SetUpTestSuite fails (for example, the device cannot be opened),
+            # and the process exits non-zero. A real skip exits 0, and a data mismatch shows as a FAILED test.
+            process_failed = step_status != 0 and "FAILED" not in statuses
+            if "SKIPPED" in statuses and not process_failed:
                 status = "SKIPPED"
                 stop = True
-            elif len(statuses) != 1 or total is None:
+            elif process_failed or len(statuses) != 1 or total is None:
                 status = "FAILED"
                 note(
                     f"RETENTION_SPLIT {RETENTION_CASE} cycle {cycle + 1}: process did not finish its test, stopping",
